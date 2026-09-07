@@ -1,0 +1,22 @@
+/.venv/
+/build/
+/dist/
+/.pytest_cache/
+/.ruff_cache/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Signing material never belongs in a memory home or its tooling
+keys/
+*.pem
+*.key
+
+# Coding-agent tooling: instruction files, per-agent configuration, workspace
+# markers and worktrees. Local to a checkout, never part of the package.
+.claude/
+.codex/
+CLAUDE.md
+AGENTS.md
+.oacp
+.worktrees/

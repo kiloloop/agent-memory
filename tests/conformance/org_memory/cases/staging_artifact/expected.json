@@ -1,0 +1,10 @@
+{
+  "description": "A lingering writer staging artifact beside a valid record \u2014 interrupted publication.",
+  "findings": [
+    {
+      "name": "debriefs-staging",
+      "severity": "warn",
+      "message_contains": "interrupted publication"
+    }
+  ]
+}
