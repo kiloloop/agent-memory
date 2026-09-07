@@ -1,0 +1,28 @@
+[+] Environment
+    [+] git — git version 2.55.0
+    [+] python3 — Python 3.11.16
+    [+] gh — gh version 2.100.0 (2026-09-03)
+    [+] ruff — ruff 0.16.2
+    [+] shellcheck — ShellCheck - shell script analysis tool
+    [+] pyyaml — available
+
+[+] Org Memory
+    [+] org-memory/debriefs/ — present
+    [+] 75 debrief file(s) — canonical layout
+
+[+] Agent Registry
+    [+] 3 agent(s), 35 project membership(s) — registered
+
+[+] Memory Sync
+    [+] .oacp-memory-repo — present
+    [+] .gitignore — canonical memory allowlist
+    [+] tracked files — 932 inside memory allowlist
+    [+] untracked memory files — none
+    [+] working tree — clean
+    [+] sync state — synced with upstream
+    [+] remote — reachable
+    [+] last commit — fresh (0 day(s) old)
+    [+] agents/ tracked files — none
+    [+] memory .gitignore overlays — 0 safe
+
+No issues found.

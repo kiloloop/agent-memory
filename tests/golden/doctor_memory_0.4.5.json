@@ -1,0 +1,125 @@
+{
+  "has_errors": false,
+  "fixed": [],
+  "categories": [
+    {
+      "name": "Environment",
+      "worst_severity": "ok",
+      "results": [
+        {
+          "name": "git",
+          "severity": "ok",
+          "message": "git \u2014 git version 2.55.0"
+        },
+        {
+          "name": "python3",
+          "severity": "ok",
+          "message": "python3 \u2014 Python 3.11.16"
+        },
+        {
+          "name": "gh",
+          "severity": "ok",
+          "message": "gh \u2014 gh version 2.100.0 (2026-09-03)"
+        },
+        {
+          "name": "ruff",
+          "severity": "ok",
+          "message": "ruff \u2014 ruff 0.16.2"
+        },
+        {
+          "name": "shellcheck",
+          "severity": "ok",
+          "message": "shellcheck \u2014 ShellCheck - shell script analysis tool"
+        },
+        {
+          "name": "pyyaml",
+          "severity": "ok",
+          "message": "pyyaml \u2014 available"
+        }
+      ]
+    },
+    {
+      "name": "Org Memory",
+      "worst_severity": "ok",
+      "results": [
+        {
+          "name": "debriefs-dir",
+          "severity": "ok",
+          "message": "org-memory/debriefs/ \u2014 present"
+        },
+        {
+          "name": "debriefs-layout",
+          "severity": "ok",
+          "message": "75 debrief file(s) \u2014 canonical layout"
+        }
+      ]
+    },
+    {
+      "name": "Agent Registry",
+      "worst_severity": "ok",
+      "results": [
+        {
+          "name": "registry",
+          "severity": "ok",
+          "message": "3 agent(s), 35 project membership(s) \u2014 registered"
+        }
+      ]
+    },
+    {
+      "name": "Memory Sync",
+      "worst_severity": "ok",
+      "results": [
+        {
+          "name": "memory-marker",
+          "severity": "ok",
+          "message": ".oacp-memory-repo \u2014 present"
+        },
+        {
+          "name": "root-gitignore",
+          "severity": "ok",
+          "message": ".gitignore \u2014 canonical memory allowlist"
+        },
+        {
+          "name": "tracked-allowlist",
+          "severity": "ok",
+          "message": "tracked files \u2014 932 inside memory allowlist"
+        },
+        {
+          "name": "untracked-memory",
+          "severity": "ok",
+          "message": "untracked memory files \u2014 none"
+        },
+        {
+          "name": "working-tree",
+          "severity": "ok",
+          "message": "working tree \u2014 clean"
+        },
+        {
+          "name": "sync-state",
+          "severity": "ok",
+          "message": "sync state \u2014 synced with upstream"
+        },
+        {
+          "name": "remote",
+          "severity": "ok",
+          "message": "remote \u2014 reachable"
+        },
+        {
+          "name": "last-commit",
+          "severity": "ok",
+          "message": "last commit \u2014 fresh (0 day(s) old)"
+        },
+        {
+          "name": "agents-tracked",
+          "severity": "ok",
+          "message": "agents/ tracked files \u2014 none"
+        },
+        {
+          "name": "memory-overlays",
+          "severity": "ok",
+          "message": "memory .gitignore overlays \u2014 0 safe"
+        }
+      ]
+    }
+  ]
+}

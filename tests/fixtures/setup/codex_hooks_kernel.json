@@ -1,0 +1,29 @@
+{
+  "description": "OACP startup verification for this workspace.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "additionalContextLimit": 4000,
+            "command": "oacp session-init --hook --pull-memory --project demo --hub-dir /home/user/oacp",
+            "statusMessage": "Checking OACP startup context",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": "^startup$"
+      },
+      {
+        "hooks": [
+          {
+            "command": "./scripts/custom-startup.sh",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "^startup$"
+      }
+    ]
+  }
+}
