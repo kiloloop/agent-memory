@@ -680,6 +680,74 @@ def test_an_unpublished_memory_file_is_a_warning_with_the_push_hint(tmp_path: Pa
     assert row.fix_hint == "Run: agent-memory push"
 
 
+def test_a_dirty_memory_tree_names_the_changes(tmp_path: Path, git_env: None) -> None:
+    home, _ = synced_home(tmp_path)
+    write(home / "projects" / "demo" / "memory" / "open_threads.md", "unpublished\n")
+    row = _by_name(check_memory_sync(home))["working-tree"]
+    assert row.severity is Severity.warn
+    assert row.message == "working tree — DIRTY 1 memory change(s): projects/demo/memory/open_threads.md"
+    assert row.fix_hint == "Run `agent-memory push` or resolve changes manually"
+
+
+def test_changes_outside_the_allowlist_are_not_dirty_memory(tmp_path: Path, git_env: None) -> None:
+    # The 0.1.0 block re-admitted a nested .gitignore at any depth. On such a home the counts
+    # are allowlist-scoped while the tree is whole-tree dirty; the row names the scope instead
+    # of reading DIRTY beside "untracked memory files — none".
+    home, _ = synced_home(tmp_path)
+    old_block = layout.gitignore_text().replace(f"!/{layout.GITIGNORE_FILE}\n", f"!{layout.GITIGNORE_FILE}\n")
+    write(home / layout.GITIGNORE_FILE, old_block)
+    git("commit", "--quiet", "-am", "the 0.1.0 block", cwd=home)
+    nested = "projects/demo/evidence/tree/.gitignore"
+    write(home / nested, "build/\n")
+
+    rows = _by_name(check_memory_sync(home))
+
+    assert rows["untracked-memory"].message == "untracked memory files — none"
+    assert rows["working-tree"].severity is Severity.warn
+    assert "DIRTY" not in rows["working-tree"].message
+    assert rows["working-tree"].message == (
+        f"working tree — 1 change(s) outside the memory allowlist: {nested}; "
+        "no memory change is pending, but memory pull refuses a dirty tree"
+    )
+    assert rows["working-tree"].fix_hint == "Commit, stash or ignore them outside the memory tiers"
+
+
+def test_a_worktree_rename_keeps_its_memory_source_pending(tmp_path: Path, git_env: None) -> None:
+    # An intent-to-add move reports as " R new\0old": the R sits in the worktree column, and the
+    # parser once read only the index column, so the source path came back sliced ("-memory/…")
+    # and the row claimed no memory change was pending while the note had left its tier.
+    home, _ = synced_home(tmp_path)
+    write(home / "org-memory" / "note.md", "note\n")
+    git("add", "org-memory/note.md", cwd=home)
+    git("commit", "--quiet", "-m", "a note", cwd=home)
+    (home / "org-memory" / "note.md").rename(home / "elsewhere.md")
+    git("add", "-N", "-f", "elsewhere.md", cwd=home)
+    status = git("status", "--porcelain=v2", cwd=home)  # ".R": index untouched, rename in the worktree column
+    assert status.startswith("2 .R ") and status.endswith("R100 elsewhere.md\torg-memory/note.md")
+
+    assert sync.changed_paths(home) == ["elsewhere.md", "org-memory/note.md"]
+    row = _by_name(check_memory_sync(home))["working-tree"]
+    assert row.severity is Severity.warn
+    assert row.message == (
+        "working tree — DIRTY 1 memory change(s): org-memory/note.md; 1 change(s) outside the memory allowlist"
+    )
+    assert row.fix_hint == "Run `agent-memory push` or resolve changes manually"
+
+
+def test_a_failed_change_readout_on_a_dirty_tree_is_a_warning(tmp_path: Path) -> None:
+    home = _scripted_home(tmp_path)
+    runner = ScriptedRunner(
+        {
+            **_clean(home),
+            ("status", "--porcelain"): (0, "?? x"),
+            ("status", "--porcelain=v1", "-z", "--untracked-files=all"): (128, "fatal: index locked"),
+        }
+    )
+    row = _by_name(check_memory_sync(home, runner=runner))["working-tree"]
+    assert row.severity is Severity.warn
+    assert "index locked" in row.message
+
+
 # --- the report and the command line ----------------------------------------
 
 

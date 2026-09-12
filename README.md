@@ -147,6 +147,7 @@ similarity queries, synthesis, or indexing. Recall reads a fixed file set.
 | [`capture`][capture-and-recall] | Record a decision. |
 | [`recall`][capture-and-recall] | Read bounded context. |
 | [`debrief write`][debrief-write] | Publish a session summary. |
+| [`event write`][event-write] | Publish an org-memory event. |
 
 [status]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#status
 [doctor]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#doctor
@@ -157,6 +158,7 @@ similarity queries, synthesis, or indexing. Recall reads a fixed file set.
 [startup]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#startup
 [capture-and-recall]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#capture-and-recall
 [debrief-write]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#debrief-write
+[event-write]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#event-write
 
 ## Examples
 

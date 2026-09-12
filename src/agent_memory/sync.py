@@ -20,10 +20,11 @@ a runtime file somebody staged by hand -- stays staged, uncommitted and
 reported. The home must be the root of its own git worktree; a home nested
 inside another repository is refused before anything is written.
 
-``.gitignore`` is never overwritten. The canonical allowlist is a managed
-block that ``init`` puts at the head of the file when it is missing and
-leaves alone when it is present, keeping every other line, and every write
-comes back with a before/after receipt.
+``.gitignore`` is never replaced wholesale. The canonical allowlist is a
+managed block that ``init`` puts at the head of the file when it is missing
+or out of date and leaves alone when it is current, keeping every other line
+except the ones an earlier block carried and the current one retired, and
+every write comes back with a before/after receipt that names them.
 
 The network verbs (fetch, pull, push, clone) run under a 30 s timeout.
 ``pull`` fast-forwards only when the tree is clean, not ahead, not diverged
@@ -56,6 +57,22 @@ DEFAULT_REMOTE = "origin"
 ENV_AGENT = "AGENT_MEMORY_AGENT"
 _AGENT_FALLBACK_ENV = ("AGENT_NAME", "USER")
 UNKNOWN_AGENT = "unknown"
+
+#: git's own words when no credential helper produced credentials and it fell back
+#: to prompting. On its own this is also what an unconfigured remote looks like.
+_CREDENTIAL_PROMPT_FAILURES = ("could not read username for", "could not read password for")
+#: What the helper itself left behind when a sandbox blocked its `op` call. Every
+#: entry must be helper-origin: paired with a prompt failure above, this is the
+#: signature -- and not a rejected push. Text git emits on its own never belongs
+#: here, however sandbox-flavoured it reads. "Device not configured" is the trap:
+#: it is macOS's errno for git's own terminal fallback, so it accompanies *every*
+#: prompt failure on the platform and identifies nothing.
+_SANDBOXED_HELPER_TELLS = ("1password document", "osstatus")
+_HELPER_BLOCKED_LINE = (
+    "memory push: the git credential helper could not run under the sandbox; its `op` call was "
+    "blocked, so git was left without credentials for the remote. Rerun with the sandbox off. "
+    "The commit remains local."
+)
 
 
 class SyncError(Exception):
@@ -90,6 +107,8 @@ class GitignoreReceipt:
     action: str
     before: Optional[str]
     after: str
+    #: Lines of an earlier managed block that the update dropped, in file order.
+    retired: Tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
@@ -104,6 +123,12 @@ class GitignoreReceipt:
         out = [
             f"{GITIGNORE_FILE}: managed block added at the top; "
             f"{len(kept.splitlines())} existing line(s) kept after it.",
+        ]
+        if self.retired:
+            out.append(
+                f"{GITIGNORE_FILE}: {len(self.retired)} superseded line(s) retired: {', '.join(self.retired)}"
+            )
+        out += [
             f"{GITIGNORE_FILE} before:",
             *_indent(self.before.splitlines() or ["(empty)"]),
             f"{GITIGNORE_FILE} after:",
@@ -147,35 +172,44 @@ def write_marker(home: Path) -> bool:
 
 
 def ensure_gitignore(home: Path) -> GitignoreReceipt:
-    """Put the managed block at the head of ``.gitignore`` unless it is already there.
+    """Put the managed block at the head of ``.gitignore`` unless it is already current.
 
     The block is the canonical allowlist from :func:`layout.gitignore_text`.
     A missing file is created with the block alone, so a fresh home's file is
     byte-identical to the canonical text. A file that already contains the
-    block, contiguous and on line boundaries, is left untouched wherever the
-    block sits. Otherwise the block goes first and every line of the existing
-    file that is not itself a block line follows it verbatim: custom rules
-    survive, and a file carrying an older version of the block is brought up
-    to date without duplicating its lines.
+    block, contiguous and on line boundaries, and none of the lines an earlier
+    block carried (:data:`layout.SUPERSEDED_GITIGNORE_LINES`) is left untouched
+    wherever the block sits. Otherwise the block goes first and every line of
+    the existing file that is neither a block line nor a superseded one follows
+    it verbatim: custom rules survive, a file carrying an older version of the
+    block is brought up to date without duplicating its lines, and the lines
+    that version retired go with it -- git reads an ignore file last-match-wins,
+    so a retired rule left after the block would keep its old effect. The
+    receipt names what was retired.
     """
     path = home / GITIGNORE_FILE
     block = layout.gitignore_text()
+    superseded = set(layout.SUPERSEDED_GITIGNORE_LINES)
     try:
         before: Optional[str] = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         before = None
+    retired: Tuple[str, ...] = ()
     if before is None:
         after, action = block, "created"
-    elif _contains_block(before, block):
-        after, action = before, "unchanged"
     else:
-        managed = set(block.splitlines())
-        kept = [line for line in before.replace("\r\n", "\n").splitlines() if line not in managed]
-        after = block + ("\n".join(kept) + "\n" if kept else "")
-        action = "updated"
+        lines = before.replace("\r\n", "\n").splitlines()
+        retired = tuple(dict.fromkeys(line for line in lines if line in superseded))
+        if _contains_block(before, block) and not retired:
+            after, action = before, "unchanged"
+        else:
+            managed = set(block.splitlines())
+            kept = [line for line in lines if line not in managed and line not in superseded]
+            after = block + ("\n".join(kept) + "\n" if kept else "")
+            action = "updated"
     if after != before:
         path.write_text(after, encoding="utf-8")
-    return GitignoreReceipt(path, action, before, after)
+    return GitignoreReceipt(path, action, before, after, retired)
 
 
 def _contains_block(text: str, block: str) -> bool:
@@ -363,7 +397,8 @@ def push(
     Silent on a home that is not configured for sync. A home that is behind
     or diverged is refused before anything is committed. A commit that could
     not be delivered -- no remote, an unreachable one, a rejected push -- is
-    reported as such, distinctly from delivery.
+    reported as such, distinctly from delivery; a credential helper a sandbox
+    blocked is named as its own cause, not as a rejection.
     """
     home = _home(home)
     if not is_configured(home):
@@ -409,13 +444,19 @@ def select_paths(home: Path, runner: Optional[GitRunner] = None) -> Tuple[List[s
     so a widened ignore file cannot smuggle a tier's unsynced subdirectory in.
     """
     pathspecs = [GITIGNORE_FILE, MARKER_FILE, *(f":(glob){tier.pattern}/**" for tier in layout.TIERS)]
-    result = _git(home, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *pathspecs], runner)
-    if not result.ok:
-        raise SyncError(f"git status failed: {result.output}")
-    paths = _parse_status_z(result.stdout)
+    paths = _status_paths(home, runner, pathspecs)
     selected = sorted(path for path in paths if layout.is_allowed_memory_path(path))
     outside = sorted(path for path in paths if not layout.is_allowed_memory_path(path))
     return selected, outside
+
+
+def changed_paths(home: Path, runner: Optional[GitRunner] = None) -> List[str]:
+    """Every path ``git status`` reports anywhere in the tree, untracked files one by one.
+
+    The whole-tree readout behind :attr:`GitState.dirty`, as paths: what ``pull``
+    refuses to fast-forward over, whether or not the allowlist selects it.
+    """
+    return _status_paths(home, runner)
 
 
 def staged_paths(home: Path, runner: Optional[GitRunner] = None) -> List[str]:
@@ -506,6 +547,8 @@ def _deliver(
     receipt: Optional[GitignoreReceipt] = None,
 ) -> Outcome:
     if state.fetch_failed:
+        if _credential_helper_blocked(state.fetch_output):
+            return _helper_blocked(lines, published, receipt)
         failure = _fetch_failure(state, "memory push")
         lines.append(f"{failure.lines[0]} The commit remains local.")
         return Outcome(failure.status, False, tuple(lines), published.committed, published.preserved, receipt)
@@ -514,6 +557,8 @@ def _deliver(
         return Outcome("up_to_date", True, tuple(lines), (), published.preserved, receipt)
     result = _push_remote(home, state, runner)
     if not result.ok:
+        if _credential_helper_blocked(result.output):
+            return _helper_blocked(lines, published, receipt)
         what = "timed out" if result.timed_out else "was rejected"
         lines.append(f"memory push: the push {what}; the commit remains local. {result.output}".rstrip())
         status = "push_timed_out" if result.timed_out else "push_failed"
@@ -528,6 +573,30 @@ def _push_remote(home: Path, state: GitState, runner: Optional[GitRunner]) -> Gi
     remote = _default_remote(home, runner)
     branch = _current_branch(home, runner)
     return _git(home, ["push", "--quiet", "-u", remote, branch], runner, timeout=NETWORK_TIMEOUT_SECONDS)
+
+
+def _credential_helper_blocked(output: str) -> bool:
+    """Does this git failure carry the blocked-credential-helper signature?
+
+    git falls back to prompting when a helper hands it nothing, and under a
+    sandbox that prompt has no terminal to read from either. Both halves are
+    required, and the second must come from the helper: a prompt failure on
+    its own is what any host without usable credentials looks like, down to
+    the errno text macOS appends to it.
+    """
+    lowered = output.lower()
+    if not any(prompt in lowered for prompt in _CREDENTIAL_PROMPT_FAILURES):
+        return False
+    return any(tell in lowered for tell in _SANDBOXED_HELPER_TELLS)
+
+
+def _helper_blocked(
+    lines: List[str], published: Outcome, receipt: Optional[GitignoreReceipt]
+) -> Outcome:
+    lines.append(_HELPER_BLOCKED_LINE)
+    return Outcome(
+        "credential_helper_blocked", False, tuple(lines), published.committed, published.preserved, receipt
+    )
 
 
 def _fetch_failure(state: GitState, verb: str) -> Outcome:
@@ -566,6 +635,16 @@ def _require_root(home: Path, runner: Optional[GitRunner]) -> None:
         )
 
 
+def _status_paths(home: Path, runner: Optional[GitRunner], pathspecs: Sequence[str] = ()) -> List[str]:
+    args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+    if pathspecs:
+        args += ["--", *pathspecs]
+    result = _git(home, args, runner)
+    if not result.ok:
+        raise SyncError(f"git status failed: {result.output}")
+    return _parse_status_z(result.stdout)
+
+
 def _status_porcelain(home: Path, runner: Optional[GitRunner]) -> str:
     result = _git(home, ["status", "--porcelain"], runner)
     if not result.ok:
@@ -599,7 +678,12 @@ def _is_non_empty(path: Path) -> bool:
 
 
 def _parse_status_z(data: str) -> List[str]:
-    """Paths from ``git status --porcelain=v1 -z``; a rename or copy contributes both of its paths."""
+    """Paths from ``git status --porcelain=v1 -z``; a rename or copy contributes both of its paths.
+
+    The ``R``/``C`` marker sits in the index column for a staged move and in the
+    worktree column for one git detects in the tree (an intent-to-add move); either
+    way the record carries the source path as the next NUL-separated field.
+    """
     paths: List[str] = []
     fields = data.split("\0")
     index = 0
@@ -609,7 +693,7 @@ def _parse_status_z(data: str) -> List[str]:
         if len(entry) < 4:
             continue
         paths.append(entry[3:])
-        if entry[0] in "RC" and index < len(fields) and fields[index]:
+        if (entry[0] in "RC" or entry[1] in "RC") and index < len(fields) and fields[index]:
             paths.append(fields[index])
             index += 1
     return paths

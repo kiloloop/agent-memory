@@ -129,6 +129,29 @@ class FetchTimesOut:
         return run_git(args, cwd=cwd, timeout=timeout)
 
 
+class FetchBlockedByCredentialHelper:
+    """The real runner, except that the fetch fails the way a sandboxed `op` call does.
+
+    The shape is the 2026-09-09 AM-09 acceptance transcript's -- the helper's own
+    TLS failure, then git's fallback prompt failing for want of a terminal -- with
+    the vault and item names replaced by placeholders. The predicate keys off
+    "1password document" and "osstatus", so no assertion here depends on what the
+    blocked secret was called, and this file ships to a public repository.
+    """
+
+    OUTPUT = (
+        "Error: could not read 1Password document 'example-signing-key' from vault "
+        "'example': [ERROR] failed to request.DoUnencrypted: Post \"/api/v3/auth/start\": "
+        "tls: failed to verify certificate: x509: OSStatus -26276\n"
+        "fatal: could not read Username for 'https://github.com': Device not configured"
+    )
+
+    def __call__(self, args: Sequence[str], *, cwd: Path, timeout: Optional[float] = None) -> GitResult:
+        if args and args[0] == "fetch":
+            return GitResult(128, "", self.OUTPUT)
+        return run_git(args, cwd=cwd, timeout=timeout)
+
+
 # --- the network verbs carry the timeout -----------------------------------
 
 
@@ -191,6 +214,71 @@ def test_fetch_timeout_on_push_keeps_the_commit_local_and_skips_the_push(tmp_pat
     assert _head_paths(home) == ["org-memory/local.md"]
     assert not any(call[0] == "push" for call in runner.calls)
     assert not _remote_has(remote, "org-memory/local.md")
+
+
+def test_a_sandboxed_credential_helper_is_named_as_its_own_failure(tmp_path: Path) -> None:
+    remote, _ = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _write(home / "org-memory" / "local.md", "local update\n")
+
+    outcome = sync.push(home, runner=FetchBlockedByCredentialHelper())
+
+    assert outcome.status == "credential_helper_blocked"
+    assert not outcome.ok
+    assert outcome.committed == ("org-memory/local.md",)
+    said = outcome.lines[-1]
+    assert "credential helper" in said and "sandbox off" in said
+    assert "The commit remains local." in said
+    assert "was rejected" not in said and "the fetch failed" not in said
+    assert _head_paths(home) == ["org-memory/local.md"]
+    assert not _remote_has(remote, "org-memory/local.md")
+
+
+#: git's prompt failure with no helper in play, as each platform spells the errno.
+#: macOS's "Device not configured" is git's own terminal fallback failing, not a
+#: helper tell -- it rides along with every prompt failure on the platform.
+PROMPT_ONLY_FAILURES = {
+    "macos": "fatal: could not read Username for 'http://127.0.0.1:62548': Device not configured",
+    "linux": "fatal: could not read Username for 'https://github.com': No such device or address",
+}
+
+
+@pytest.mark.parametrize("platform", sorted(PROMPT_ONLY_FAILURES))
+def test_a_prompt_failure_without_helper_evidence_is_not_a_blocked_helper(platform: str) -> None:
+    """Both halves are required, and the second one has to come from the helper."""
+    assert not sync._credential_helper_blocked(PROMPT_ONLY_FAILURES[platform])
+
+
+def test_helper_evidence_alongside_the_prompt_failure_is_the_signature() -> None:
+    assert sync._credential_helper_blocked(FetchBlockedByCredentialHelper.OUTPUT)
+
+
+@pytest.mark.parametrize("platform", sorted(PROMPT_ONLY_FAILURES))
+def test_a_prompt_failure_keeps_the_generic_diagnostic_through_delivery(
+    tmp_path: Path, platform: str
+) -> None:
+    """The whole path, not just the predicate: no helper evidence, no sandbox claim."""
+    output = PROMPT_ONLY_FAILURES[platform]
+
+    class FetchFailsWithoutAHelper:
+        def __call__(self, args: Sequence[str], *, cwd: Path, timeout: Optional[float] = None) -> GitResult:
+            if args and args[0] == "fetch":
+                return GitResult(128, "", output)
+            return run_git(args, cwd=cwd, timeout=timeout)
+
+    remote, _ = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _write(home / "org-memory" / "local.md", "local update\n")
+
+    outcome = sync.push(home, runner=FetchFailsWithoutAHelper())
+
+    assert outcome.status == "fetch_failed"
+    assert not outcome.ok
+    said = outcome.lines[-1]
+    assert output in said and "The commit remains local." in said
+    assert "sandbox" not in said and "credential helper" not in said
 
 
 # --- the selected root must be the worktree root ---------------------------
@@ -284,6 +372,65 @@ def test_init_upgrades_an_older_block_without_duplicating_its_lines(tmp_path: Pa
 
     assert outcome.receipt is not None and outcome.receipt.action == "updated"
     assert (home / ".gitignore").read_text(encoding="utf-8") == CANONICAL + "private-notes/\n"
+
+
+#: The block 0.1.0 wrote: the root entries unanchored, so git re-admitted a file of either
+#: name at any depth and an excluded tree's own ignore file read as an untracked change.
+OLD_BLOCK = CANONICAL.replace(f"!/{layout.GITIGNORE_FILE}\n", f"!{layout.GITIGNORE_FILE}\n").replace(
+    f"!/{MARKER}\n", f"!{MARKER}\n"
+)
+SUPERSEDED = layout.SUPERSEDED_GITIGNORE_LINES
+NESTED_IGNORE = "projects/demo/evidence/tree/.gitignore"
+
+
+def test_the_old_block_differs_from_canonical_by_the_superseded_pair() -> None:
+    assert OLD_BLOCK != CANONICAL
+    assert [line for line in OLD_BLOCK.splitlines() if line not in CANONICAL.splitlines()] == list(SUPERSEDED)
+
+
+def test_init_retires_the_unanchored_root_entries_of_the_old_block(tmp_path: Path) -> None:
+    # A home carrying the 0.1.0 block ends with the anchored lines and no unanchored survivor,
+    # and the nested ignore file that read as an untracked change is ignored again.
+    home = _local_home(tmp_path)
+    _write(home / ".gitignore", OLD_BLOCK)
+    _write(home / NESTED_IGNORE, "build/\n")
+    assert f"?? {NESTED_IGNORE}" in _git("status", "--porcelain", "--untracked-files=all", cwd=home)
+
+    outcome = sync.init(home)
+
+    receipt = outcome.receipt
+    assert outcome.ok and receipt is not None and receipt.action == "updated"
+    assert receipt.retired == SUPERSEDED
+    after = (home / ".gitignore").read_text(encoding="utf-8")
+    assert after == CANONICAL
+    assert not any(line in SUPERSEDED for line in after.splitlines())
+    assert f".gitignore: 2 superseded line(s) retired: {', '.join(SUPERSEDED)}" in outcome.lines
+    assert _git("status", "--porcelain", "--untracked-files=all", cwd=home) == ""
+
+
+def test_init_keeps_a_genuine_custom_negation_rule_while_retiring_the_old_pair(tmp_path: Path) -> None:
+    # Retirement is by exact line, so a user's own negation rule survives the migration.
+    home = _local_home(tmp_path)
+    custom = "# mine\n!notes/**\n"
+    _write(home / ".gitignore", OLD_BLOCK + custom)
+
+    outcome = sync.init(home)
+
+    assert outcome.receipt is not None and outcome.receipt.retired == SUPERSEDED
+    assert (home / ".gitignore").read_text(encoding="utf-8") == CANONICAL + custom
+
+
+def test_init_retires_a_stale_pair_left_after_a_current_block(tmp_path: Path) -> None:
+    # The shape a block-only fix would have left behind: the current block with the old pair
+    # surviving after it as "custom rules", still re-admitting nested files last-match-wins.
+    home = _local_home(tmp_path)
+    _write(home / ".gitignore", CANONICAL + "\n".join(SUPERSEDED) + "\n")
+
+    outcome = sync.init(home)
+
+    assert outcome.receipt is not None and outcome.receipt.action == "updated"
+    assert outcome.receipt.retired == SUPERSEDED
+    assert (home / ".gitignore").read_text(encoding="utf-8") == CANONICAL
 
 
 def test_init_keeps_the_bytes_of_an_existing_marker(tmp_path: Path) -> None:
@@ -852,3 +999,32 @@ def test_status_parser_takes_both_paths_of_a_rename() -> None:
     data = "R  new.md\0old.md\0 M other.md\0?? fresh.md\0"
     assert sync._parse_status_z(data) == ["new.md", "old.md", "other.md", "fresh.md"]
     assert sync._parse_status_z("") == []
+
+
+@pytest.mark.parametrize("xy", ["R ", " R", "RM", "C ", " C"])
+def test_status_parser_reads_the_rename_marker_in_either_column(xy: str) -> None:
+    # Staged moves carry R/C in the index column; a move git detects in the tree (intent-to-add)
+    # carries it in the worktree column. Both records are followed by the source path.
+    assert sync._parse_status_z(f"{xy} new.md\0old.md\0 M other.md\0") == ["new.md", "old.md", "other.md"]
+
+
+def test_push_commits_a_rename_git_detects_in_the_working_tree(tmp_path: Path) -> None:
+    # The source of an intent-to-add move once came back sliced ("-memory/a.md") and push
+    # refused it as a path outside the allowlist.
+    remote, _ = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _write(home / "org-memory" / "a.md", "a\n")
+    assert sync.push(home).ok
+    (home / "org-memory" / "a.md").rename(home / "org-memory" / "b.md")
+    _git("add", "-N", "-f", "org-memory/b.md", cwd=home)
+    status = _git("status", "--porcelain=v2", cwd=home)  # ".R": index untouched, rename in the worktree column
+    assert status.startswith("2 .R ") and status.endswith("R100 org-memory/b.md\torg-memory/a.md")
+
+    assert sync.select_paths(home) == (["org-memory/a.md", "org-memory/b.md"], [])
+    outcome = sync.push(home)
+
+    assert outcome.status == "pushed" and outcome.ok, outcome.lines
+    assert outcome.committed == ("org-memory/b.md",)  # HEAD reports a rename by its destination
+    assert _git("status", "--porcelain", cwd=home) == ""
+    assert _git("show", "--name-status", "--format=", "HEAD", cwd=home) == "R100\torg-memory/a.md\torg-memory/b.md"

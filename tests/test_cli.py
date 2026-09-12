@@ -156,7 +156,8 @@ def test_distribution_version_matches_the_package() -> None:
 def test_source_tree_names_the_kernel_only_where_allowed() -> None:
     # The only permitted mentions: the compat env var line(s), the sync marker filename,
     # setup/legacy.py (which retires the kernel's hooks by exact match and so must spell them),
-    # and the debrief writer's hidden --oacp-dir alias (the flag it carried before it became a verb).
+    # and the hidden --oacp-dir alias of the two writer verbs, debrief write and event write (the flag
+    # each carried before it became a verb).
     src = CHECKOUT / "src" / "agent_memory"
     if not src.is_dir():
         pytest.skip("no source checkout beside the tests")
@@ -176,7 +177,7 @@ def test_source_tree_names_the_kernel_only_where_allowed() -> None:
                 continue
             offending.append(f"{path.relative_to(CHECKOUT)}:{number}: {line.strip()}")
     assert offending == []
-    assert alias_lines == 1
+    assert alias_lines == 2
 
 
 def test_import_resolves_to_the_installed_wheel_when_asked() -> None:

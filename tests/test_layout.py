@@ -20,7 +20,8 @@ def _digest(root: Path) -> Dict[str, str]:
 
 
 def test_gitignore_text_matches_the_golden_bytes() -> None:
-    # tests/golden/canonical_memory_gitignore.txt is a byte copy of the 0.4.5 kernel's canonical text.
+    # tests/golden/canonical_memory_gitignore.txt is the canonical text byte for byte. It is deliberately
+    # ahead of the 0.4.5 kernel's fixture (the root entries are anchored); the kernel's copy follows separately.
     assert layout.gitignore_text().encode("utf-8") == GOLDEN.read_bytes()
 
 
@@ -30,6 +31,21 @@ def test_gitignore_denies_keystore_last() -> None:
     # The deny must come after every allowlist line so it wins for keys/
     # even if a future edit widens the allowlist above it.
     assert lines.index("keys/") > max(index for index, line in enumerate(lines) if line.startswith("!"))
+
+
+def test_the_ignore_file_and_the_marker_are_root_only() -> None:
+    # Anchored: a .gitignore or a marker deeper in the tree is ignored like anything else
+    # the allowlist leaves out, instead of reading as an untracked memory change.
+    lines = layout.gitignore_text().splitlines()
+    assert f"!/{layout.GITIGNORE_FILE}" in lines and f"!/{layout.MARKER_FILE}" in lines
+    assert f"!{layout.GITIGNORE_FILE}" not in lines and f"!{layout.MARKER_FILE}" not in lines
+
+
+def test_superseded_lines_are_the_unanchored_pair_and_never_current() -> None:
+    # The retired set stays disjoint from the block: a line in both would make every
+    # ensure_gitignore run report an update that changes nothing.
+    assert layout.SUPERSEDED_GITIGNORE_LINES == (f"!{layout.GITIGNORE_FILE}", f"!{layout.MARKER_FILE}")
+    assert not set(layout.SUPERSEDED_GITIGNORE_LINES) & set(layout.gitignore_text().splitlines())
 
 
 def test_marker_and_gitignore_names_are_the_fleet_contract() -> None:

@@ -444,15 +444,7 @@ def check_memory_sync(
         state = None
 
     if state is not None:
-        if state.dirty:
-            cat.add(
-                "working-tree",
-                Severity.warn,
-                "working tree — DIRTY memory changes present",
-                "Run `agent-memory push` or resolve changes manually",
-            )
-        else:
-            cat.add("working-tree", Severity.ok, "working tree — clean")
+        _add_working_tree(cat, home, runner, state)
 
         text = f"sync state — {sync_state_text(state)}"
         if not state.has_remote:
@@ -532,6 +524,40 @@ def check_memory_sync(
         cat.add("memory-overlays", Severity.ok, f"memory .gitignore overlays — {len(overlays)} safe")
 
     return cat
+
+
+def _add_working_tree(cat: Category, home: Path, runner: Optional[GitRunner], state: GitState) -> None:
+    """The tree row, scoped like the counts above it.
+
+    Memory changes inside the allowlist are what ``push`` would publish and
+    read DIRTY. Changes anywhere else are named as outside the allowlist: not
+    memory content, but ``pull`` still refuses a tree that carries them.
+    """
+    if not state.dirty:
+        cat.add("working-tree", Severity.ok, "working tree — clean")
+        return
+    try:
+        changed = sync.changed_paths(home, runner)
+    except sync.SyncError as exc:
+        cat.add("working-tree", Severity.warn, f"working tree — DIRTY; the change readout failed: {exc}")
+        return
+    memory = [path for path in changed if layout.is_allowed_memory_path(path)]
+    elsewhere = [path for path in changed if not layout.is_allowed_memory_path(path)]
+    if memory:
+        text = f"working tree — DIRTY {len(memory)} memory change(s): {_summarize(memory)}"
+        if elsewhere:
+            text += f"; {len(elsewhere)} change(s) outside the memory allowlist"
+        cat.add("working-tree", Severity.warn, text, "Run `agent-memory push` or resolve changes manually")
+    elif elsewhere:
+        cat.add(
+            "working-tree",
+            Severity.warn,
+            f"working tree — {len(elsewhere)} change(s) outside the memory allowlist: {_summarize(elsewhere)}; "
+            "no memory change is pending, but memory pull refuses a dirty tree",
+            "Commit, stash or ignore them outside the memory tiers",
+        )
+    else:
+        cat.add("working-tree", Severity.ok, "working tree — clean")
 
 
 def enclosing_repository(home: Path, runner: Optional[GitRunner] = None) -> Optional[Path]:

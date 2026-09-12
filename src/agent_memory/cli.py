@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import __version__, archive, debrief, doctor, org, setup, startup, status, sync, workflow
+from . import __version__, archive, debrief, doctor, events, org, setup, startup, status, sync, workflow
 from .home import BINDING_FILE, HomeError, HomeResolution, find_project, resolve_home
 
 EXIT_OK = 0
@@ -189,6 +189,38 @@ def build_parser() -> argparse.ArgumentParser:
     write.add_argument("--oacp-dir", dest="home", metavar="PATH", help=argparse.SUPPRESS)
     write.add_argument("--dry-run", action="store_true", help="validate and compose the record, print it, and write nothing")
     write.add_argument("--json", dest="json_output", action="store_true", help="emit a machine-readable result")
+    event_ = commands.add_parser("event", help="Org-memory event commands.", description="Org-memory event commands.")
+    event_commands = event_.add_subparsers(dest="event_command", metavar="<command>")
+    event_help = (
+        "Publish one org-memory event into the home's events store, failure-atomically: the canonical path only ever "
+        "holds a complete, verified record, byte-identical to the kernel's write-event script for the same inputs. "
+        "Exit 0 published (or an identical record was already there), 1 on a validation error, 2 on a publication "
+        "failure."
+    )
+    event_write = event_commands.add_parser("write", parents=[common], help=event_help, description=event_help)
+    event_write.set_defaults(handler=_event_write)
+    event_write.add_argument("--agent", required=True, help="agent creating the event")
+    event_write.add_argument("--project", required=True, help="originating project")
+    event_write.add_argument(
+        "--type", dest="event_type", required=True, choices=sorted(events.ALLOWED_TYPES), help="event type"
+    )
+    event_write.add_argument(
+        "--slug", required=True, help="short slug for the filename: lowercase alphanumerics and hyphens, no dots"
+    )
+    event_body = event_write.add_mutually_exclusive_group()
+    event_body.add_argument("--body", help="event body, inline")
+    event_body.add_argument("--body-file", help="path to the event body in Markdown, or '-' to read stdin")
+    event_write.add_argument("--source-ref", help="provenance id, e.g. the debrief stem the event was folded from")
+    event_write.add_argument(
+        "--related", help="cross-references: comma-separated or a JSON array (e.g. 'PR #43,issue #10')"
+    )
+    event_write.add_argument("--supersedes", help="path of the event this entry overrides")
+    # The kernel script's home flag; accepted, unadvertised, through v0.1.x.
+    event_write.add_argument("--oacp-dir", dest="home", metavar="PATH", help=argparse.SUPPRESS)
+    event_write.add_argument(
+        "--dry-run", action="store_true", help="validate and compose the record, print it, and write nothing"
+    )
+    event_write.add_argument("--json", dest="json_output", action="store_true", help="emit a machine-readable result")
     return parser
 
 
@@ -412,6 +444,85 @@ def _debrief_write(args: argparse.Namespace) -> int:
         sys.stderr.buffer.write(result.record)
         sys.stderr.buffer.flush()
     return EXIT_OK
+
+
+def _event_write(args: argparse.Namespace) -> int:
+    home = resolve_home(args.home).path
+    try:
+        body = _event_body(args)
+    except OSError as exc:
+        print(f"ERROR: cannot read body: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    except events.WriterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return exc.code
+
+    try:
+        result = events.write_event(
+            home=home,
+            agent=args.agent,
+            project=args.project,
+            event_type=args.event_type,
+            slug=args.slug,
+            body=body,
+            source_ref=args.source_ref,
+            related=events.normalize_related(args.related) if args.related else None,
+            supersedes=args.supersedes,
+            dry_run=args.dry_run,
+        )
+    except events.WriterError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return exc.code
+    except OSError as exc:
+        print(f"ERROR: publication failed: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "path": str(result.path),
+                    "status": result.status,
+                    "created_at_utc": result.created_at_utc,
+                    "date": result.created_at_utc[:10],
+                    "agent": args.agent,
+                    "project": args.project,
+                    "type": args.event_type,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"{result.status}: {result.path}")
+        print(f"created_at_utc: {result.created_at_utc}")
+
+    if args.dry_run:
+        print("--- record preview (nothing was written) ---", file=sys.stderr)
+        sys.stderr.flush()
+        sys.stderr.buffer.write(result.record)
+        sys.stderr.buffer.flush()
+    return EXIT_OK
+
+
+def _event_body(args: argparse.Namespace) -> bytes:
+    """The body bytes: ``--body-file`` (a path, or ``-`` for stdin), ``--body``, else piped stdin.
+
+    Trailing newlines are dropped, as the kernel script drops them; the record
+    closes the body with exactly one. A body file is read as text, so its
+    CRLF and CR line endings become LF (:func:`events.body_from_file`); stdin
+    and the inline body are taken as given, both as the script does.
+    """
+    if args.body_file is not None and args.body_file != "-":
+        return events.body_from_file(Path(args.body_file).expanduser().read_bytes())
+    if args.body_file is not None:
+        raw = sys.stdin.buffer.read()
+    elif args.body is not None:
+        raw = args.body.encode("utf-8")
+    elif not sys.stdin.isatty():
+        raw = sys.stdin.buffer.read()
+    else:
+        raise events.WriterError("no body provided: use --body, --body-file <path|->, or pipe the body to stdin", 1)
+    return raw.rstrip(b"\n")
 
 
 def _report(outcome: sync.Outcome) -> int:
