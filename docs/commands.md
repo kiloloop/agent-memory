@@ -21,7 +21,8 @@ the tree is dirty or diverged (ahead and behind are reported, not failed).
 layout (presence, canonical paths, staging leftovers, symlinks; it never opens
 a record, and a traversal it cannot finish is an error row, never a pass) and
 the sync repository (marker, allowlist, tracked and untracked memory files,
-tree, upstream, remote, last-commit age, per-instance state, overlay ignores).
+the tree with memory changes told apart from changes outside the allowlist,
+upstream, remote, last-commit age, per-instance state, overlay ignores).
 It reads no memory content, repairs nothing, exits 1 only on an error row,
 and points at `memory-lint` when that is installed; `--json` emits the same
 rows as data.
@@ -41,12 +42,16 @@ credentials. `org init` is the org tier alone, for a home that already exists.
 ## Sync
 
 `enable` makes the home a git repository of its own, puts the sync allowlist at
-the head of its `.gitignore` as a managed block (existing lines are kept, and
-the write comes with a before/after receipt), drops the sync marker, and makes
+the head of its `.gitignore` as a managed block (existing lines are kept, lines
+an earlier block carried are retired, and the write comes with a before/after
+receipt that names them), drops the sync marker, and makes
 one commit. With `--remote`, `enable` also pushes that initial commit. `push` commits only what the allowlist selects, as a partial
 commit, so anything else staged in the index stays staged and uncommitted;
 it refuses a home that is behind or diverged, and a push the remote rejects
-leaves the local commit in place and says so. `pull` fast-forwards only when
+leaves the local commit in place and says so. A credential helper a sandbox
+blocked is a distinct failure from a rejection -- git prompts for a username
+and has no terminal to read it from -- and `push` names it as such; the remedy
+is to rerun with the sandbox off. `pull` fast-forwards only when
 the tree is clean, not ahead, not diverged, and has an upstream. `clone`
 brings a memory repository down; `disable` removes the marker. The network
 verbs time out after 30 seconds. The engine never reads memory content,
@@ -158,3 +163,33 @@ record reports as a collision. That narrower contract rests on the store
 directory not being writable by other users, its default mode, so the swap
 needs the owner's own uid; it is a platform limitation. Either way the writer restages and
 retries, and a swap that persists is reported with the canonical path absent.
+
+## Event write
+
+`event write` publishes one org-memory event into the home's events store,
+at `org-memory/events/<YYYYMMDD>-<HHMMSS>-<slug>.md`: the mechanical writer
+the layout spec names, ported from the kernel's `write-event` script and
+byte-identical to it for the same inputs. The record is a frontmatter block
+of plain scalars (`created_at_utc`, `date`, `agent`, `project`, `type`, then
+`source_ref`, `related` and `supersedes` when given), a blank line, the body
+with its trailing newlines dropped, and one closing newline. Because the
+scalars are plain, a value a YAML reader would not hand back verbatim -- a
+control character, a leading indicator, `: ` or ` #` inside, or a string it
+re-types such as `true`, `12` or `2026-03-21` -- is refused (exit 1) rather
+than written. The body comes from `--body`, from `--body-file <path>` or
+`--body-file -` (stdin), or from piped stdin when neither is given. A body
+file is read as text, as the script reads it, so its CRLF and CR line endings
+become LF and a Windows-authored file lands the same record as its LF twin;
+stdin and `--body` are taken as given. `--type` is one of `decision`,
+`event`, `rule`; the slug is lowercase alphanumerics and hyphens,
+alphanumeric at both ends, no dots. Publication is the writer
+contract of `debrief write`, through the same `agent_memory.publication`
+module: staged in a private file, verified through the descriptor that wrote
+it by a check that parses the frontmatter back, published with an atomic
+no-replace link, and read back. An identical record already at the name is
+idempotent (exit 0, the file untouched), a differing one is a collision (exit
+2, a published record is never replaced), and a failure before the link
+leaves `events/` with no partial record and no staging debris. `--dry-run`
+composes and prints the record and touches nothing; `--json` reports the
+path, status, stamp and identity. The verb appends one event and reads
+nothing; synthesis stays with the caller.

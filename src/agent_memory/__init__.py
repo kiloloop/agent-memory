@@ -4,6 +4,6 @@
 
 from .home import HomeError, HomeResolution, resolve_home
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = ["HomeError", "HomeResolution", "__version__", "resolve_home"]

@@ -39,6 +39,19 @@ WILDCARD = "*"
 NEVER_SYNCED_DIRS: Tuple[str, ...] = ("keys",)
 _NEVER_SYNCED_COMMENT = "# never sync private key material — explicit deny, wins over any future allowlist widening"
 
+#: Lines earlier versions of the managed block carried and the current one does
+#: not. :func:`agent_memory.sync.ensure_gitignore` retires them when it brings a
+#: home's block up to date. Left in place they would follow the block as custom
+#: rules and, git reading an ignore file last-match-wins, keep their old effect.
+#: A block edit that changes or drops a line appends the old line here; never
+#: remove an entry, a home somewhere may still carry it.
+SUPERSEDED_GITIGNORE_LINES: Tuple[str, ...] = (
+    # Unanchored through 0.1.0: re-admitted a .gitignore or a marker at any depth,
+    # so an excluded tree's own ignore file read as an untracked change and blocked pull.
+    f"!{GITIGNORE_FILE}",
+    f"!{MARKER_FILE}",
+)
+
 
 @dataclass(frozen=True)
 class Tier:
@@ -79,7 +92,10 @@ TIERS: Tuple[Tier, ...] = (ORG, PROJECT)
 
 def gitignore_text() -> str:
     """The canonical sync allowlist for a home's ``.gitignore``, byte for byte."""
-    lines = [WILDCARD, f"!{WILDCARD}/", f"!{GITIGNORE_FILE}", f"!{MARKER_FILE}"]
+    # The ignore file and the marker are root-only: anchored, so neither entry
+    # re-admits a same-named file deeper in the tree. One that sits inside a tier
+    # is still ordinary tier content; anywhere else it stays ignored.
+    lines = [WILDCARD, f"!{WILDCARD}/", f"!/{GITIGNORE_FILE}", f"!/{MARKER_FILE}"]
     lines.extend(f"!{tier.pattern}/**" for tier in TIERS)
     lines.extend(f"{tier.pattern}/{sub}/" for tier in TIERS for sub in tier.unsynced)
     lines.append(_NEVER_SYNCED_COMMENT)
