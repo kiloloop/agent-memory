@@ -492,9 +492,9 @@ def test_cli_reads_the_body_from_a_file_and_drops_trailing_newlines(tmp_path, ca
 
 
 # The kernel script reads a body FILE as text (universal newlines: CRLF and CR
-# become LF) and takes stdin and --body as given; probed against the script at
-# oacp-dev 9fe2f76 on 2026-09-10: file CRLF -> 'First line\nSecond line', stdin
-# CRLF -> 'A\r\nB\r\n\r', inline CRLF -> 'a\r\nb\r'. Round-1 F-001 (codex).
+# become LF) and takes stdin and --body as given; probed against the script on
+# 2026-09-10: file CRLF -> 'First line\nSecond line', stdin CRLF ->
+# 'A\r\nB\r\n\r', inline CRLF -> 'a\r\nb\r'.
 KERNEL_CRLF_FILE = b"First line\r\nSecond line\r\n\r\n"
 KERNEL_CRLF_FILE_BODY = b"First line\nSecond line"
 

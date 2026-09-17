@@ -13,7 +13,39 @@ is `<home>/projects/<name>/workspace.json`), then `~/agent-memory`.
 `status` prints where the home resolves and where its sync stands: the rule
 that chose the home, the marker, the allowlist, the tiers, then the tree and
 the upstream. It contacts the remote only with `--fetch`, and it exits 1 when
-the tree is dirty or diverged (ahead and behind are reported, not failed).
+the tree is dirty or diverged (ahead and behind are reported, not failed) or
+when a prerequisite failed.
+
+`status --json` prints the same readout as one object, with the same exit
+code:
+
+| Key | Holds |
+| --- | --- |
+| `ok` | `true` exactly when the exit code is 0 |
+| `home`, `source`, `project`, `exists` | the resolved path, the rule that chose it, the bound project, whether the path is a directory |
+| `layout` | `marker`, `gitignore`, `org_memory`, `projects`; `null` when the home does not exist |
+| `sync` | `configured`, `repository`, `enclosing`, `state`, `state_text`, `remote`, `upstream`, `fetched`, `ahead`, `behind`, `dirty`, `diverged`; `null` when the home does not exist, and the fields git reports are `null` when git was not read |
+| `prerequisites` | `ok`, `reason`, `message`, `remedy`, `git` (`present`, `version`), `credential_helper` (`checked`, `blocked`) |
+
+`sync.state` is one of `synced`, `ahead`, `behind`, `diverged`,
+`no_upstream`, `local_only` or `fetch_failed`; `state_text` is the phrase the
+table prints.
+
+### Prerequisites
+
+`status` and `doctor` share three prerequisite failures. Each exits
+non-zero, puts its code in `prerequisites.reason`, and prints the same
+message and remedy in the table:
+
+| `reason` | When |
+| --- | --- |
+| `home_unresolved` | The resolved home is not a directory (exit 1), or the resolution itself failed, e.g. on a broken binding (exit 2, as on every verb; `--json` still prints the readout) |
+| `git_missing` | Git does not run, and the home carries the sync marker. Without the marker, `git.present` is reported but nothing fails |
+| `credential_helper_blocked` | A fetch failed because a sandbox blocked the git credential helper. The helper runs only when git has no cached credential for the remote, so after an unsandboxed fetch or push the same sandboxed run passes. Judged only when a fetch ran: always for `doctor`, with `--fetch` for `status` |
+
+On a blocked helper, the sync row names the cause instead of repeating the
+helper's output, which can name the secret it was after. Other fetch failures
+still print git's output, which is their only diagnostic.
 
 ## Doctor
 
@@ -23,9 +55,10 @@ a record, and a traversal it cannot finish is an error row, never a pass) and
 the sync repository (marker, allowlist, tracked and untracked memory files,
 the tree with memory changes told apart from changes outside the allowlist,
 upstream, remote, last-commit age, per-instance state, overlay ignores).
-It reads no memory content, repairs nothing, exits 1 only on an error row,
-and points at `memory-lint` when that is installed; `--json` emits the same
-rows as data.
+It reads no memory content, repairs nothing, exits 1 on an error row or a
+failed [prerequisite](#prerequisites), and points at `memory-lint` when that
+is installed; `--json` emits the same rows as data, followed by the
+`prerequisites` block that `status --json` carries.
 
 ## Init
 

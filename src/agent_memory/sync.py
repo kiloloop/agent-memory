@@ -547,7 +547,7 @@ def _deliver(
     receipt: Optional[GitignoreReceipt] = None,
 ) -> Outcome:
     if state.fetch_failed:
-        if _credential_helper_blocked(state.fetch_output):
+        if credential_helper_blocked(state.fetch_output):
             return _helper_blocked(lines, published, receipt)
         failure = _fetch_failure(state, "memory push")
         lines.append(f"{failure.lines[0]} The commit remains local.")
@@ -557,7 +557,7 @@ def _deliver(
         return Outcome("up_to_date", True, tuple(lines), (), published.preserved, receipt)
     result = _push_remote(home, state, runner)
     if not result.ok:
-        if _credential_helper_blocked(result.output):
+        if credential_helper_blocked(result.output):
             return _helper_blocked(lines, published, receipt)
         what = "timed out" if result.timed_out else "was rejected"
         lines.append(f"memory push: the push {what}; the commit remains local. {result.output}".rstrip())
@@ -575,9 +575,10 @@ def _push_remote(home: Path, state: GitState, runner: Optional[GitRunner]) -> Gi
     return _git(home, ["push", "--quiet", "-u", remote, branch], runner, timeout=NETWORK_TIMEOUT_SECONDS)
 
 
-def _credential_helper_blocked(output: str) -> bool:
+def credential_helper_blocked(output: str) -> bool:
     """Does this git failure carry the blocked-credential-helper signature?
 
+    The one detector: ``doctor`` and ``status`` read fetch output through it too.
     git falls back to prompting when a helper hands it nothing, and under a
     sandbox that prompt has no terminal to read from either. Both halves are
     required, and the second must come from the helper: a prompt failure on

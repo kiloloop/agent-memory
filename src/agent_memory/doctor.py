@@ -36,8 +36,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import layout, sync
+from . import layout, prerequisites, sync
 from .git_runner import GitResult, GitRunner, run_git
+from .prerequisites import Prerequisites
 from .sync import GitState
 
 #: A last commit older than this many days is reported stale.
@@ -109,7 +110,15 @@ def run_doctor(
     home: Path, *, runner: Optional[GitRunner] = None, now: Optional[dt.datetime] = None
 ) -> List[Category]:
     """Both memory categories for ``home``, in report order."""
-    return [check_org_memory(home), check_memory_sync(home, runner=runner, now=now)]
+    return diagnose(home, runner=runner, now=now)[0]
+
+
+def diagnose(
+    home: Path, *, runner: Optional[GitRunner] = None, now: Optional[dt.datetime] = None
+) -> Tuple[List[Category], Prerequisites]:
+    """Both memory categories in report order, and the prerequisite readout the sync checks took."""
+    memory_sync, readout = _memory_sync(home, runner=runner, now=now)
+    return [check_org_memory(home), memory_sync], readout
 
 
 def find_memory_lint(which: Callable[[str], Optional[str]] = shutil.which) -> Optional[str]:
@@ -135,10 +144,16 @@ def report(categories: Sequence[Category], *, memory_lint: Optional[str] = None)
     return "\n".join(lines) + "\n"
 
 
-def to_json(categories: Sequence[Category], *, memory_lint: Optional[str] = None) -> Dict[str, Any]:
-    """The report as data, in the same order as the text."""
+def to_json(
+    categories: Sequence[Category],
+    *,
+    memory_lint: Optional[str] = None,
+    prerequisites: Optional[Prerequisites] = None,
+) -> Dict[str, Any]:
+    """The report as data, in the same order as the text; ``prerequisites`` goes last, so the
+    rows before it read as they did without it."""
     output: Dict[str, Any] = {
-        "has_errors": has_errors(categories),
+        "has_errors": has_errors(categories) or (prerequisites is not None and not prerequisites.ok),
         "memory_lint": memory_lint,
         "categories": [],
     }
@@ -152,6 +167,8 @@ def to_json(categories: Sequence[Category], *, memory_lint: Optional[str] = None
         output["categories"].append(
             {"name": category.name, "worst_severity": category.worst_severity.value, "results": rows}
         )
+    if prerequisites is not None:
+        output["prerequisites"] = prerequisites.to_json()
     return output
 
 
@@ -325,14 +342,21 @@ def check_memory_sync(
     home: Path, *, runner: Optional[GitRunner] = None, now: Optional[dt.datetime] = None
 ) -> Category:
     """The sync setup and the repository's state, through git alone; nothing is changed."""
+    return _memory_sync(home, runner=runner, now=now)[0]
+
+
+def _memory_sync(
+    home: Path, *, runner: Optional[GitRunner], now: Optional[dt.datetime]
+) -> Tuple[Category, Prerequisites]:
     cat = Category("Memory Sync")
     marker = layout.MARKER_FILE
+    git = prerequisites.probe_git(runner)
 
     try:
         configured = _is_file(sync.marker_path(home))
     except OSError as exc:
         cat.add("memory-marker", Severity.warn, f"{marker} — {_not_inspected(exc)}")
-        return cat
+        return cat, prerequisites.assess(git, configured=False)
     if not configured:
         cat.add(
             "memory-marker",
@@ -340,9 +364,18 @@ def check_memory_sync(
             f"{marker} — not configured; memory sync hooks are disabled",
             "Run: agent-memory enable [--remote URL]",
         )
-        return cat
+        return cat, prerequisites.assess(git, configured=False)
     cat.add("memory-marker", Severity.ok, f"{marker} — present")
 
+    if not git.present:
+        # Without git every readout below fails, and "not a git repository" would be the wrong finding.
+        cat.add(
+            "memory-git",
+            Severity.error,
+            f"{marker} — present, but {prerequisites.GIT_MISSING_TEXT}",
+            prerequisites.GIT_MISSING_REMEDY,
+        )
+        return cat, prerequisites.assess(git, configured=True)
     if not sync.is_git_repo(home, runner):
         cat.add(
             "memory-git",
@@ -350,7 +383,7 @@ def check_memory_sync(
             f"{marker} — present, but {home} is not a git repository",
             "Run `agent-memory enable`, or `agent-memory disable` to remove the marker",
         )
-        return cat
+        return cat, prerequisites.assess(git, configured=True)
     enclosing = enclosing_repository(home, runner)
     if enclosing is not None:
         # The sync verbs refuse this home; reading the enclosing repository's state as the home's would be wrong.
@@ -361,7 +394,7 @@ def check_memory_sync(
             "a memory home must be the root of its own repository",
             "Move the home out of the enclosing repository, or `agent-memory disable` to remove the marker",
         )
-        return cat
+        return cat, prerequisites.assess(git, configured=True)
 
     root_gitignore = home / layout.GITIGNORE_FILE
     try:
@@ -450,6 +483,10 @@ def check_memory_sync(
         if not state.has_remote:
             cat.add("sync-state", Severity.ok, text)
             cat.add("remote", Severity.skip, "remote — skipped; local-only memory repo")
+        elif prerequisites.helper_blocked(state):
+            # Not the network and not the remote's permissions: git never had credentials to try with.
+            cat.add("sync-state", Severity.error, text, prerequisites.HELPER_BLOCKED_REMEDY)
+            cat.add("remote", Severity.skip, "remote — not checked; the sandbox blocked the git credential helper")
         elif state.fetch_failed:
             cat.add("sync-state", Severity.warn, text, "Check network access and remote permissions")
             cat.add("remote", Severity.warn, "remote — not reachable", "Check network access and remote permissions")
@@ -523,7 +560,8 @@ def check_memory_sync(
     else:
         cat.add("memory-overlays", Severity.ok, f"memory .gitignore overlays — {len(overlays)} safe")
 
-    return cat
+    fetched = state is not None and state.has_remote
+    return cat, prerequisites.assess(git, configured=True, state=state, fetched=fetched)
 
 
 def _add_working_tree(cat: Category, home: Path, runner: Optional[GitRunner], state: GitState) -> None:
@@ -568,10 +606,30 @@ def enclosing_repository(home: Path, runner: Optional[GitRunner] = None) -> Opti
     return root
 
 
+def sync_state(state: GitState) -> str:
+    """Where the repository stands, as the code ``status --json`` carries beside :func:`sync_state_text`."""
+    if not state.has_remote:
+        return "local_only"
+    if state.fetch_failed:
+        return "fetch_failed"
+    if not state.has_upstream:
+        return "no_upstream"
+    if state.diverged:
+        return "diverged"
+    if state.behind:
+        return "behind"
+    if state.ahead:
+        return "ahead"
+    return "synced"
+
+
 def sync_state_text(state: GitState) -> str:
     """One phrase for where the repository stands; ``status`` and ``doctor`` share it."""
     if not state.has_remote:
         return "local-only; no remote configured"
+    if prerequisites.helper_blocked(state):
+        # The helper's own output names the secret it was after; the phrase names the cause instead.
+        return f"remote fetch failed: {prerequisites.HELPER_BLOCKED_TEXT}"
     if state.fetch_failed:
         return f"remote fetch failed: {state.fetch_output}"
     if not state.has_upstream:

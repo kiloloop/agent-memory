@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from . import __version__, archive, debrief, doctor, events, org, setup, startup, status, sync, workflow
+from . import __version__, archive, debrief, doctor, events, org, prerequisites, setup, startup, status, sync, workflow
 from .home import BINDING_FILE, HomeError, HomeResolution, find_project, resolve_home
 
 EXIT_OK = 0
@@ -51,16 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         _status,
         "Show which home resolves, which rule chose it, whether the layout is in place, and where the sync stands. "
-        "Exit 1 when the tree is dirty or diverged.",
+        "Exit 1 when the tree is dirty or diverged, or a prerequisite (git, the home, the credential helper) failed.",
     )
     status_.add_argument(
         "--fetch", action="store_true", help="contact the remote before counting ahead/behind (no network otherwise)"
     )
+    status_.add_argument("--json", dest="json_output", action="store_true", help="emit the readout as JSON")
     doctor_ = add(
         "doctor",
         _doctor,
         "Check the home's setup and health: the debrief store's layout and the sync repository. "
-        "Reads no memory content; repairs nothing. Exit 1 on an error row.",
+        "Reads no memory content; repairs nothing. Exit 1 on an error row or a failed prerequisite.",
     )
     doctor_.add_argument("--json", dest="json_output", action="store_true", help="emit the report as JSON")
     init_ = add(
@@ -235,23 +236,44 @@ def _max_chars(value: str) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
-    readout = status.inspect(resolve_home(args.home), fetch=args.fetch)
-    print("\n".join(readout.lines()))
+    try:
+        resolution = resolve_home(args.home)
+    except HomeError as exc:
+        if not args.json_output:
+            raise
+        print(json.dumps(status.unresolved(exc), indent=2))
+        return EXIT_USAGE
+    readout = status.inspect(resolution, fetch=args.fetch)
+    if args.json_output:
+        print(json.dumps(readout.to_json(), indent=2))
+    else:
+        print("\n".join(readout.lines()))
     return readout.exit_code
 
 
 def _doctor(args: argparse.Namespace) -> int:
-    home = resolve_home(args.home).path
-    if not home.is_dir():
-        print(f"agent-memory: error: {home} is not a directory", file=sys.stderr)
-        return EXIT_FAILED
-    categories = doctor.run_doctor(home)
     memory_lint = doctor.find_memory_lint()
+    try:
+        home = resolve_home(args.home).path
+    except HomeError as exc:
+        if not args.json_output:
+            raise
+        unresolved = prerequisites.home_error(exc)
+        print(json.dumps(doctor.to_json([], memory_lint=memory_lint, prerequisites=unresolved), indent=2))
+        return EXIT_USAGE
+    if not home.is_dir():
+        missing = prerequisites.home_missing(home)
+        if args.json_output:
+            print(json.dumps(doctor.to_json([], memory_lint=memory_lint, prerequisites=missing), indent=2))
+        elif missing.failure:
+            print(f"agent-memory: error: {missing.failure.line()}", file=sys.stderr)
+        return EXIT_FAILED
+    categories, readout = doctor.diagnose(home)
     if args.json_output:
-        print(json.dumps(doctor.to_json(categories, memory_lint=memory_lint), indent=2))
+        print(json.dumps(doctor.to_json(categories, memory_lint=memory_lint, prerequisites=readout), indent=2))
     else:
         sys.stdout.write(doctor.report(categories, memory_lint=memory_lint))
-    return EXIT_FAILED if doctor.has_errors(categories) else EXIT_OK
+    return EXIT_FAILED if doctor.has_errors(categories) or not readout.ok else EXIT_OK
 
 
 def _init(args: argparse.Namespace) -> int:
