@@ -10,6 +10,8 @@ import pytest
 from agent_memory import layout, sync
 from agent_memory.git_runner import EXIT_TIMEOUT, GitResult, run_git
 
+from conftest import PROMPT_ONLY_FAILURES, FetchBlockedByCredentialHelper
+
 GOLDEN = Path(__file__).resolve().parent / "golden" / "canonical_memory_gitignore.txt"
 CANONICAL = layout.gitignore_text()
 MARKER = layout.MARKER_FILE
@@ -129,29 +131,6 @@ class FetchTimesOut:
         return run_git(args, cwd=cwd, timeout=timeout)
 
 
-class FetchBlockedByCredentialHelper:
-    """The real runner, except that the fetch fails the way a sandboxed `op` call does.
-
-    The shape is the 2026-09-09 AM-09 acceptance transcript's -- the helper's own
-    TLS failure, then git's fallback prompt failing for want of a terminal -- with
-    the vault and item names replaced by placeholders. The predicate keys off
-    "1password document" and "osstatus", so no assertion here depends on what the
-    blocked secret was called, and this file ships to a public repository.
-    """
-
-    OUTPUT = (
-        "Error: could not read 1Password document 'example-signing-key' from vault "
-        "'example': [ERROR] failed to request.DoUnencrypted: Post \"/api/v3/auth/start\": "
-        "tls: failed to verify certificate: x509: OSStatus -26276\n"
-        "fatal: could not read Username for 'https://github.com': Device not configured"
-    )
-
-    def __call__(self, args: Sequence[str], *, cwd: Path, timeout: Optional[float] = None) -> GitResult:
-        if args and args[0] == "fetch":
-            return GitResult(128, "", self.OUTPUT)
-        return run_git(args, cwd=cwd, timeout=timeout)
-
-
 # --- the network verbs carry the timeout -----------------------------------
 
 
@@ -235,23 +214,14 @@ def test_a_sandboxed_credential_helper_is_named_as_its_own_failure(tmp_path: Pat
     assert not _remote_has(remote, "org-memory/local.md")
 
 
-#: git's prompt failure with no helper in play, as each platform spells the errno.
-#: macOS's "Device not configured" is git's own terminal fallback failing, not a
-#: helper tell -- it rides along with every prompt failure on the platform.
-PROMPT_ONLY_FAILURES = {
-    "macos": "fatal: could not read Username for 'http://127.0.0.1:62548': Device not configured",
-    "linux": "fatal: could not read Username for 'https://github.com': No such device or address",
-}
-
-
 @pytest.mark.parametrize("platform", sorted(PROMPT_ONLY_FAILURES))
 def test_a_prompt_failure_without_helper_evidence_is_not_a_blocked_helper(platform: str) -> None:
     """Both halves are required, and the second one has to come from the helper."""
-    assert not sync._credential_helper_blocked(PROMPT_ONLY_FAILURES[platform])
+    assert not sync.credential_helper_blocked(PROMPT_ONLY_FAILURES[platform])
 
 
 def test_helper_evidence_alongside_the_prompt_failure_is_the_signature() -> None:
-    assert sync._credential_helper_blocked(FetchBlockedByCredentialHelper.OUTPUT)
+    assert sync.credential_helper_blocked(FetchBlockedByCredentialHelper.OUTPUT)
 
 
 @pytest.mark.parametrize("platform", sorted(PROMPT_ONLY_FAILURES))

@@ -791,7 +791,7 @@ def test_setup_receipts_never_sync(tmp_path: Path, git_env: None) -> None:
     assert ignored.returncode == 0
 
 
-# --- the workflow file beside the hook (AM-07) -----------------------------------
+# --- the workflow file beside the hook -------------------------------------------
 
 
 def test_workflow_paths_are_the_runtimes_repository_skill_files() -> None:

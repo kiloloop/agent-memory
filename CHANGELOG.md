@@ -4,6 +4,17 @@ All notable changes to agent-memory are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2 - 2026-09-17
+
+### Added
+
+- `status --json` prints the readout as one object, with an `ok` flag and a `prerequisites` block ([status](docs/commands.md#status)).
+
+### Fixed
+
+- `status` and `doctor` exit non-zero with a reason code when a prerequisite such as git fails ([prerequisites](docs/commands.md#prerequisites)).
+- `doctor` and `status --fetch` name a sandbox-blocked credential helper, not an unreachable remote ([doctor](docs/commands.md#doctor)).
+
 ## 0.1.1 - 2026-09-12
 
 ### Added

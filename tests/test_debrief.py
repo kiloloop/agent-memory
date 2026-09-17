@@ -425,7 +425,7 @@ def test_publication_binds_to_the_inode_that_was_verified(tmp_path, monkeypatch)
     assert imposter.read_bytes() == _record(), "the imposter's own name is untouched"
 
 
-# ---- the staging name swapped at the link (codex PR #19 r1, F-001) ---------
+# ---- the staging name swapped at the link ----------------------------------
 # Between the fstat that verified the stage and the link that publishes it, an
 # actor with write access to the directory can turn the staging NAME into a
 # hard link or a symlink to a foreign partial file. Foreign bytes are never the

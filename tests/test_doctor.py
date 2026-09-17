@@ -19,16 +19,16 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
-from agent_memory import doctor, layout, sync
+from agent_memory import doctor, layout, prerequisites, sync
 from agent_memory.cli import main
 from agent_memory.doctor import Severity, check_memory_sync, check_org_memory, run_doctor
 from agent_memory.git_runner import EXIT_TIMEOUT, GitResult, run_git
 
-from conftest import git, synced_home, write
+from conftest import PROMPT_ONLY_FAILURES, FetchBlockedByCredentialHelper, git, synced_home, write
 
 TESTS = Path(__file__).resolve().parent
 GOLDEN_TEXT = TESTS / "golden" / "doctor_memory_0.4.5.txt"
@@ -471,6 +471,64 @@ def test_memory_sync_state_rows(
     assert results["remote"].severity is remote_severity
 
 
+def test_memory_sync_names_a_blocked_helper_with_its_remedy_not_as_an_unreachable_remote(tmp_path: Path) -> None:
+    # The fetch output is faked; a live repro needs the sandbox AND a cold credential cache
+    # (FetchBlockedByCredentialHelper says why), which is how this went unnoticed.
+    home = _scripted_home(tmp_path)
+    runner = ScriptedRunner({**_clean(home), ("fetch", "--quiet"): (128, FetchBlockedByCredentialHelper.OUTPUT)})
+    (_, category), readout = doctor.diagnose(home, runner=runner)
+    results = _by_name(category)
+    assert (results["sync-state"].severity, results["sync-state"].message, results["sync-state"].fix_hint) == (
+        Severity.error,
+        f"sync state — remote fetch failed: {prerequisites.HELPER_BLOCKED_TEXT}",
+        prerequisites.HELPER_BLOCKED_REMEDY,
+    )
+    assert results["remote"].severity is Severity.skip
+    assert "not reachable" not in results["remote"].message
+    shown = doctor.report([category]) + json.dumps(doctor.to_json([category], prerequisites=readout))
+    assert "1Password" not in shown and "example-signing-key" not in shown
+    assert "Check network access" not in shown
+    assert readout.reason == prerequisites.CREDENTIAL_HELPER_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        *(PROMPT_ONLY_FAILURES[platform] for platform in sorted(PROMPT_ONLY_FAILURES)),
+        "fatal: unable to access 'https://example.invalid/memory.git/': Could not resolve host: example.invalid",
+        "remote: Permission to example-org/memory.git denied to example-user.\n"
+        "fatal: unable to access 'https://example.invalid/memory.git/': The requested URL returned error: 403",
+    ],
+    ids=["prompt-only-linux", "prompt-only-macos", "unreachable", "permissions"],
+)
+def test_memory_sync_fetch_failures_without_the_signature_keep_todays_wording(tmp_path: Path, output: str) -> None:
+    home = _scripted_home(tmp_path)
+    runner = ScriptedRunner({**_clean(home), ("fetch", "--quiet"): (128, output)})
+    (_, category), readout = doctor.diagnose(home, runner=runner)
+    results = _by_name(category)
+    assert (results["sync-state"].severity, results["sync-state"].message, results["sync-state"].fix_hint) == (
+        Severity.warn,
+        f"sync state — remote fetch failed: {output}",
+        "Check network access and remote permissions",
+    )
+    assert (results["remote"].severity, results["remote"].message) == (Severity.warn, "remote — not reachable")
+    assert readout.ok
+    assert readout.to_json()["credential_helper"] == {"checked": True, "blocked": False}
+
+
+def test_memory_sync_without_git_is_an_error_row_not_a_layout_finding(
+    tmp_path: Path, git_env: None, no_git: Callable[[], None]
+) -> None:
+    home, _ = synced_home(tmp_path)
+    no_git()
+    (_, category), readout = doctor.diagnose(home)
+    assert _rows(category) == [("memory-marker", Severity.ok), ("memory-git", Severity.error)]
+    row = category.results[1]
+    assert prerequisites.GIT_MISSING_TEXT in row.message and "not a git repository" not in row.message
+    assert row.fix_hint == prerequisites.GIT_MISSING_REMEDY
+    assert (readout.reason, readout.git) == (prerequisites.GIT_MISSING, prerequisites.GitProbe(False))
+
+
 def test_memory_sync_last_commit_age(tmp_path: Path, git_env: None) -> None:
     home, _ = synced_home(tmp_path)
     fresh = _by_name(check_memory_sync(home))["last-commit"]
@@ -799,6 +857,25 @@ def test_cli_json_output(tmp_path: Path, git_env: None, capsys: pytest.CaptureFi
     data = json.loads(capsys.readouterr().out)
     assert data["has_errors"] is False
     assert [category["name"] for category in data["categories"]] == list(MEMORY_CATEGORIES)
+
+
+def test_json_moves_only_by_the_prerequisites_block(tmp_path: Path, git_env: None, capsys: pytest.CaptureFixture[str]) -> None:
+    home, _ = synced_home(tmp_path)
+    categories, readout = doctor.diagnose(home)
+    before = json.dumps(doctor.to_json(categories), indent=2)
+    after = json.dumps(doctor.to_json(categories, prerequisites=readout), indent=2)
+    # The block is appended last, so everything before it is the same bytes up to the comma that joins it.
+    assert after.startswith(before[: -len("\n}")] + ",\n  \"prerequisites\": {")
+    assert readout.to_json() == {
+        "ok": True,
+        "reason": None,
+        "message": None,
+        "remedy": None,
+        "git": {"present": True, "version": readout.git.version if readout.git else None},
+        "credential_helper": {"checked": True, "blocked": False},
+    }
+    assert main(["doctor", "--home", str(home), "--json"]) == 0
+    assert list(json.loads(capsys.readouterr().out)) == ["has_errors", "memory_lint", "categories", "prerequisites"]
 
 
 def test_cli_refuses_a_missing_home(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

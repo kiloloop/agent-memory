@@ -1,20 +1,22 @@
 # SPDX-FileCopyrightText: 2026 Kiloloop
 # SPDX-License-Identifier: Apache-2.0
-"""``agent-memory status``: the readout and the exit contract (0 clean, 1 dirty or diverged)."""
+"""``agent-memory status``: the readout, its JSON, and the exit contract (0 clean; 1 dirty, diverged, or a
+failed prerequisite)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
-from agent_memory import layout, status, sync
+from agent_memory import layout, prerequisites, status, sync
 from agent_memory.cli import main
 from agent_memory.git_runner import GitResult, run_git
 from agent_memory.home import HomeResolution, resolve_home
 
-from conftest import git, synced_home, write
+from conftest import FetchBlockedByCredentialHelper, git, synced_home, write
 
 
 @pytest.fixture
@@ -154,6 +156,97 @@ def test_fetch_is_opt_in_and_carries_the_network_timeout(tmp_path: Path, git_env
     assert [timeout for call, timeout in contacting.calls if call[:1] == ("fetch",)] == [sync.NETWORK_TIMEOUT_SECONDS]
     assert readout.fetched is True
     assert readout.exit_code == 0
+
+
+# --- the JSON readout and the prerequisites --------------------------------
+
+
+def test_json_round_trips_with_the_fields_the_table_shows(tmp_path: Path, git_env: None, capsys) -> None:
+    home, _ = synced_home(tmp_path)
+    assert main(["status", "--home", str(home), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert list(data) == ["ok", "home", "source", "project", "exists", "layout", "sync", "prerequisites"]
+    assert (data["ok"], data["home"], data["source"], data["exists"]) == (True, str(home), "flag", True)
+    assert data["layout"] == {"marker": True, "gitignore": "canonical", "org_memory": True, "projects": 0}
+    assert data["sync"] == {
+        "configured": True,
+        "repository": True,
+        "enclosing": None,
+        "state": "synced",
+        "state_text": "synced with upstream",
+        "remote": True,
+        "upstream": "origin/main",
+        "fetched": False,
+        "ahead": 0,
+        "behind": 0,
+        "dirty": False,
+        "diverged": False,
+    }
+    readout = data["prerequisites"]
+    assert (readout["ok"], readout["reason"], readout["message"], readout["remedy"]) == (True, None, None, None)
+    assert readout["git"]["present"] is True and readout["git"]["version"]
+    assert readout["credential_helper"] == {"checked": False, "blocked": None}
+
+
+def test_json_ok_is_the_exit_code(tmp_path: Path, git_env: None, capsys) -> None:
+    home, _ = synced_home(tmp_path)
+    write(home / layout.ORG.pattern / "recent.md", "unpublished\n")
+    assert main(["status", "--home", str(home), "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert (data["ok"], data["sync"]["dirty"], data["prerequisites"]["ok"]) == (False, True, True)
+
+
+def test_a_missing_home_has_no_layout_or_sync_block(tmp_path: Path, capsys) -> None:
+    assert main(["status", "--home", str(tmp_path / "nope"), "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert (data["exists"], data["layout"], data["sync"]) == (False, None, None)
+    assert data["prerequisites"]["reason"] == prerequisites.HOME_UNRESOLVED
+
+
+def test_git_off_path_is_a_prerequisite_failure_not_a_layout_finding(
+    tmp_path: Path, git_env: None, no_git: Callable[[], None], out
+) -> None:
+    home, _ = synced_home(tmp_path)
+    no_git()
+    readout = status.inspect(_resolution(home))
+    assert readout.exit_code == 1
+    assert readout.lines()[-2:] == [
+        f"sync: not read ({prerequisites.GIT_MISSING})",
+        f"prerequisite failed: {prerequisites.GIT_MISSING} — {prerequisites.GIT_MISSING_TEXT}. "
+        f"{prerequisites.GIT_MISSING_REMEDY}.",
+    ]
+    assert not any("not a git repository" in line for line in readout.lines())
+    assert readout.to_json()["sync"]["repository"] is None
+
+
+def test_a_blocked_helper_is_named_and_its_output_stays_out_of_the_readout(tmp_path: Path, git_env: None) -> None:
+    # The runner fakes the helper's failure; see FetchBlockedByCredentialHelper for why a live repro needs a
+    # cold credential cache as well as the sandbox.
+    home, _ = synced_home(tmp_path)
+    readout = status.inspect(_resolution(home), fetch=True, runner=FetchBlockedByCredentialHelper())
+    assert readout.exit_code == 1
+    lines = readout.lines()
+    assert f"sync: remote fetch failed: {prerequisites.HELPER_BLOCKED_TEXT}" in lines
+    assert lines[-1].startswith(f"prerequisite failed: {prerequisites.CREDENTIAL_HELPER_BLOCKED} — ")
+    data = readout.to_json()
+    assert data["sync"]["state"] == "fetch_failed"
+    assert data["prerequisites"]["credential_helper"] == {"checked": True, "blocked": True}
+    shown = "\n".join(lines) + json.dumps(data)
+    assert "1Password" not in shown and "example-signing-key" not in shown
+
+    # Without --fetch the helper never runs, so it is not judged.
+    quiet = status.inspect(_resolution(home), runner=FetchBlockedByCredentialHelper())
+    assert quiet.exit_code == 0
+    assert quiet.to_json()["prerequisites"]["credential_helper"] == {"checked": False, "blocked": None}
+
+
+def test_a_fetch_failure_without_the_signature_is_not_a_prerequisite(tmp_path: Path, git_env: None) -> None:
+    home, _ = synced_home(tmp_path)
+    git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=home)
+    readout = status.inspect(_resolution(home), fetch=True)
+    assert readout.exit_code == 0
+    assert readout.prerequisites.to_json()["credential_helper"] == {"checked": True, "blocked": False}
+    assert any(line.startswith("sync: remote fetch failed: ") and "gone.git" in line for line in readout.lines())
 
 
 def test_gitignore_states(tmp_path: Path) -> None:
