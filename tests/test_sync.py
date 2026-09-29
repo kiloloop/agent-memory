@@ -720,7 +720,7 @@ def test_push_with_nothing_new_is_up_to_date(tmp_path: Path) -> None:
     assert outcome.committed == ()
 
 
-def test_push_refuses_a_repository_behind_its_upstream(tmp_path: Path) -> None:
+def test_push_resolves_a_repository_behind_its_upstream(tmp_path: Path) -> None:
     remote, seed = _create_remote(tmp_path)
     home = tmp_path / "home"
     sync.clone(home, str(remote))
@@ -730,13 +730,13 @@ def test_push_refuses_a_repository_behind_its_upstream(tmp_path: Path) -> None:
 
     outcome = sync.push(home)
 
-    assert outcome.status == "behind" and not outcome.ok
-    assert "pull before pushing" in outcome.lines[0]
-    assert _commit_count(home) == before
+    assert outcome.status == "pushed" and outcome.ok
+    assert _commit_count(home) == before + 2
+    assert _remote_has(remote, "org-memory/local.md")
     assert (home / "org-memory" / "local.md").read_text(encoding="utf-8") == "local update\n"
 
 
-def test_push_refuses_a_diverged_repository_without_committing(tmp_path: Path) -> None:
+def test_push_rebases_existing_and_new_commits(tmp_path: Path) -> None:
     remote, seed = _create_remote(tmp_path)
     home = tmp_path / "home"
     sync.clone(home, str(remote))
@@ -749,8 +749,9 @@ def test_push_refuses_a_diverged_repository_without_committing(tmp_path: Path) -
 
     outcome = sync.push(home)
 
-    assert outcome.status == "diverged" and not outcome.ok
-    assert _commit_count(home) == before
+    assert outcome.status == "pushed" and outcome.ok
+    assert _commit_count(home) == before + 2
+    assert _remote_has(remote, "org-memory/uncommitted.md")
     assert (home / "org-memory" / "uncommitted.md").is_file()
 
 
@@ -802,7 +803,7 @@ def test_pull_refuses_a_dirty_tree(tmp_path: Path) -> None:
     assert (home / "org-memory" / "recent.md").read_text(encoding="utf-8") == "edited locally\n"
 
 
-def test_pull_refuses_a_diverged_repository(tmp_path: Path) -> None:
+def test_pull_rebases_a_diverged_repository_and_reports_ahead(tmp_path: Path) -> None:
     remote, seed = _create_remote(tmp_path)
     home = tmp_path / "home"
     sync.clone(home, str(remote))
@@ -813,8 +814,8 @@ def test_pull_refuses_a_diverged_repository(tmp_path: Path) -> None:
 
     outcome = sync.pull(home)
 
-    assert outcome.status == "diverged" and not outcome.ok
-    assert not (home / "org-memory" / "remote.md").exists()
+    assert outcome.status == "ahead" and outcome.ok
+    assert (home / "org-memory" / "remote.md").exists()
 
 
 def test_pull_with_unpushed_commits_is_not_an_error(tmp_path: Path) -> None:
@@ -828,7 +829,7 @@ def test_pull_with_unpushed_commits_is_not_an_error(tmp_path: Path) -> None:
     outcome = sync.pull(home)
 
     assert outcome.status == "ahead" and outcome.ok
-    assert "1 unpushed commit(s)" in outcome.lines[0]
+    assert "1 unpushed commit(s)" in outcome.lines[-1]
 
 
 def test_pull_when_already_synced(tmp_path: Path) -> None:
@@ -998,3 +999,185 @@ def test_push_commits_a_rename_git_detects_in_the_working_tree(tmp_path: Path) -
     assert outcome.committed == ("org-memory/b.md",)  # HEAD reports a rename by its destination
     assert _git("status", "--porcelain", cwd=home) == ""
     assert _git("show", "--name-status", "--format=", "HEAD", cwd=home) == "R100\torg-memory/a.md\torg-memory/b.md"
+
+
+# Real git shapes; all repository names, identities and contents are synthetic.
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_dirty_behind_commits_rebases_delivers(tmp_path: Path, verb, duplicate: bool) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/peer.md", "peer content\n")
+    if duplicate:
+        _write(home / "org-memory/peer.md", "peer content\n")
+    _write(home / "org-memory/local.md", "local content\n")
+    outcome = verb(home, agent="test-agent")
+    assert outcome.ok and outcome.status == "pushed"
+    assert _git("status", "--porcelain", cwd=home) == ""
+    assert _git("rev-parse", "HEAD", cwd=home) == _git("rev-parse", "origin/main", cwd=home)
+    assert _remote_has(remote, "org-memory/local.md")
+    assert (home / "org-memory/peer.md").read_text() == "peer content\n"
+    assert _git("log", "-1", "--format=%s", cwd=home).startswith("memory: test-agent@")
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_only_identical_untracked_add_becomes_up_to_date(tmp_path: Path, verb) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/peer.md", "same\n")
+    _write(home / "org-memory/peer.md", "same\n")
+    outcome = verb(home, agent="test-agent")
+    assert outcome.status == "up_to_date" and outcome.ok
+    assert outcome.committed == ("org-memory/peer.md",)
+    assert _git("rev-parse", "HEAD", cwd=home) == _git("rev-parse", "HEAD", cwd=seed)
+    assert _git("status", "--porcelain", cwd=home) == ""
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+@pytest.mark.parametrize("path", ["org-memory/recent.md", "org-memory/same path.md"])
+def test_conflict_aborts_and_retains_local_commit(tmp_path: Path, verb, path: str) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, path, "upstream\n")
+    _write(home / path, "local\n")
+    before = _git("rev-parse", "HEAD", cwd=home)
+    outcome = verb(home, agent="test-agent")
+    assert outcome.status == "diverged" and not outcome.ok
+    assert path in outcome.lines[-1]
+    assert _git("rev-parse", "HEAD^", cwd=home) == before
+    assert (home / path).read_text() == "local\n"
+    assert _git("status", "--porcelain", cwd=home) == ""
+    assert not (home / ".git/rebase-merge").exists()
+    assert not (home / ".git/rebase-apply").exists()
+    assert _git("--git-dir", str(remote), "show", f"main:{path}", cwd=tmp_path) == "upstream"
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_behind_preserves_foreign_index_and_worktree(tmp_path: Path, verb) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/peer.md", "peer\n")
+    _write(home / RUNTIME_FILE, "staged\n")
+    _git("add", "-f", RUNTIME_FILE, cwd=home)
+    _write(home / RUNTIME_FILE, "unstaged\n")
+    _write(home / "org-memory/local.md", "memory\n")
+    _git("config", "rebase.autoStash", "true", cwd=home)
+    outcome = verb(home, agent="test-agent")
+    assert outcome.status == "dirty" and not outcome.ok
+    assert outcome.preserved == (RUNTIME_FILE,)
+    assert _git("show", f":{RUNTIME_FILE}", cwd=home) == "staged"
+    assert (home / RUNTIME_FILE).read_text() == "unstaged\n"
+    assert not _remote_has(remote, "org-memory/local.md")
+    assert not (home / ".git/rebase-merge").exists()
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_existing_rebase_is_never_published_or_aborted(tmp_path: Path, verb) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/recent.md", "remote\n")
+    _write(home / "org-memory/recent.md", "local\n")
+    _git("add", "org-memory/recent.md", cwd=home)
+    _git("commit", "-qm", "local", cwd=home)
+    _git("fetch", cwd=home)
+    result = run_git(["rebase", "origin/main"], cwd=home)
+    assert not result.ok
+    before = _git("status", "--porcelain", cwd=home)
+    outcome = verb(home, agent="test-agent")
+    assert outcome.status == "operation_in_progress" and not outcome.ok
+    assert _git("status", "--porcelain", cwd=home) == before
+    assert (home / ".git/rebase-merge").exists()
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_dirty_fetch_timeout_keeps_commit_and_identity(tmp_path: Path, verb) -> None:
+    remote, _ = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _write(home / "org-memory/local.md", "local\n")
+    outcome = verb(home, agent="test-agent", runner=FetchTimesOut())
+    assert outcome.status == "fetch_timed_out" and not outcome.ok
+    assert outcome.committed == ("org-memory/local.md",)
+    assert _git("status", "--porcelain", cwd=home) == ""
+    assert _git("log", "-1", "--format=%s", cwd=home).startswith("memory: test-agent@")
+    assert not _remote_has(remote, "org-memory/local.md")
+
+
+def test_pull_cli_requires_agent_for_dirty_publication(tmp_path: Path, capsys) -> None:
+    from agent_memory.cli import main
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/peer.md", "peer\n")
+    _write(home / "org-memory/local.md", "local\n")
+    assert main(["pull", "--home", str(home)]) == 1
+    assert "--agent" in capsys.readouterr().err
+    assert main(["pull", "--home", str(home), "--agent", "test-agent"]) == 0
+    assert _remote_has(remote, "org-memory/local.md")
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_rebase_timeout_aborts_or_names_recovery_failure(tmp_path: Path, verb, abort_fails: bool) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/recent.md", "upstream\n")
+    _write(home / "org-memory/recent.md", "local\n")
+    before = _git("rev-parse", "HEAD", cwd=home)
+
+    def runner(args, *, cwd, timeout=None):
+        if "rebase" in args and "--no-autostash" in args:
+            assert timeout == sync.NETWORK_TIMEOUT_SECONDS
+            # A real conflict leaves the same in-progress state a timeout can.
+            assert not run_git(args, cwd=cwd, timeout=timeout).ok
+            return GitResult(EXIT_TIMEOUT, "", "synthetic rebase timeout")
+        if list(args) == ["rebase", "--abort"] and abort_fails:
+            return GitResult(1, "", "synthetic abort failure")
+        return run_git(args, cwd=cwd, timeout=timeout)
+
+    outcome = verb(home, agent="test-agent", runner=runner)
+    assert not outcome.ok
+    if abort_fails:
+        assert outcome.status == "rebase_abort_failed"
+        assert "manual recovery" in outcome.lines[-1]
+        assert (home / ".git/rebase-merge").exists()
+    else:
+        assert outcome.status == "pull_timed_out"
+        assert "org-memory/recent.md" in outcome.lines[-1]
+        assert _git("rev-parse", "HEAD^", cwd=home) == before
+        assert (home / "org-memory/recent.md").read_text() == "local\n"
+        assert _git("status", "--porcelain", cwd=home) == ""
+        assert not (home / ".git/rebase-merge").exists()
+    assert _git("--git-dir", str(remote), "show", "main:org-memory/recent.md", cwd=tmp_path) == "upstream"
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_local_merge_content_is_not_dropped_by_rebase(tmp_path: Path, verb) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _git("checkout", "-qb", "side", cwd=home)
+    _write(home / "org-memory/side.md", "side\n")
+    _git("add", "org-memory/side.md", cwd=home)
+    _git("commit", "-qm", "side", cwd=home)
+    _git("checkout", "main", cwd=home)
+    _write(home / "org-memory/main.md", "main\n")
+    _git("add", "org-memory/main.md", cwd=home)
+    _git("commit", "-qm", "main", cwd=home)
+    _git("merge", "--no-commit", "side", cwd=home)
+    _write(home / "org-memory/merge-only.md", "merge resolution\n")
+    _git("add", "org-memory/merge-only.md", cwd=home)
+    _git("commit", "-qm", "merge", cwd=home)
+    before = _git("rev-parse", "HEAD", cwd=home)
+    _commit_and_push(seed, "org-memory/upstream.md", "upstream\n")
+    outcome = verb(home, agent="test-agent")
+    assert outcome.status == "diverged" and not outcome.ok
+    assert "merge commits" in outcome.lines[-1]
+    assert _git("rev-parse", "HEAD", cwd=home) == before
+    assert (home / "org-memory/merge-only.md").read_text() == "merge resolution\n"

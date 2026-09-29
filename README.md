@@ -75,7 +75,7 @@ Python 3.10+ is required; sync needs git 2.25+, hooks use Bash, and
    agent-memory enable --remote git@github.com:YOUR_ORG/agent-memory-store.git
    agent-memory push --agent codex
    # After another machine pushes, with a clean local tree:
-   agent-memory pull
+   agent-memory pull --agent claude
    ```
 
    Elsewhere, `agent-memory clone <remote-url> --home <local-home>`, then repeat
@@ -111,13 +111,14 @@ points into a home's `projects/` tree. Project selection uses `--project` or a
 matching binding/marker. OACP is not required.
 
 Sync makes the home a git repository with an allowlist and `.oacp-memory-repo`
-marker. `push` commits selected paths; `pull` fast-forwards a clean tree that
-is not ahead or diverged. No merges; keys and setup receipts stay local.
-Network verbs time out after 30 seconds.
+marker. `push` and `pull --agent NAME` commit selected paths, rebase when behind,
+and deliver. A plain `pull` updates a clean tree and reports unpushed commits.
+Conflicts abort the rebase and retain local commits. Keys and setup receipts
+stay local. Network and rebase operations time out after 30 seconds.
 
 `setup` installs a SessionStart hook and memory workflow. `startup` lists
 metadata for the four project files, then the three curated org files; it
-injects no content. `--pull` refreshes first, warning on failure. The workflow
+injects no content. `--pull` commits and syncs first under the runtime identity, warning on failure. The workflow
 tells the agent to run `recall` for an 8,000-character bounded read. Raise
 `--max-chars` or read remaining files directly when cut. `capture` records
 decisions during work. At the end, update threads and debt, optionally publish

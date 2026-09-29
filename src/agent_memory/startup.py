@@ -72,7 +72,7 @@ def build_manifest(
     warnings: List[str] = list(notes)
     files: List[Dict[str, Any]] = []
 
-    sync_info, pull_info = _sync(home, pull, runner, warnings)
+    sync_info, pull_info = _sync(home, pull, runner, warnings, runtime)
     if project is not None:
         try:
             layout.validate_project_name(project)
@@ -154,14 +154,14 @@ def _entry(home: Path, path: Path, tier: str, name: str) -> Dict[str, Any]:
 
 
 def _sync(
-    home: Path, pull: bool, runner: Optional[GitRunner], warnings: List[str]
+    home: Path, pull: bool, runner: Optional[GitRunner], warnings: List[str], runtime: str
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     marker = sync.is_configured(home)
     info: Dict[str, Any] = {"marker": marker, "last_commit_at_utc": None}
     pull_info: Dict[str, Any] = {"requested": pull, "status": PULL_NOT_REQUESTED, "ok": True, "lines": []}
     if pull:
         try:
-            outcome = sync.pull(home, runner=runner)
+            outcome = sync.pull(home, agent=runtime, runner=runner)
             pull_info = {"requested": True, "status": outcome.status, "ok": outcome.ok, "lines": list(outcome.lines)}
         except (sync.SyncError, OSError) as exc:
             pull_info = {"requested": True, "status": PULL_ERROR, "ok": False, "lines": [f"memory pull: {exc}"]}

@@ -78,17 +78,26 @@ credentials. `org init` is the org tier alone, for a home that already exists.
 the head of its `.gitignore` as a managed block (existing lines are kept, lines
 an earlier block carried are retired, and the write comes with a before/after
 receipt that names them), drops the sync marker, and makes
-one commit. With `--remote`, `enable` also pushes that initial commit. `push` commits only what the allowlist selects, as a partial
-commit, so anything else staged in the index stays staged and uncommitted;
-it refuses a home that is behind or diverged, and a push the remote rejects
-leaves the local commit in place and says so. A credential helper a sandbox
-blocked is a distinct failure from a rejection -- git prompts for a username
-and has no terminal to read it from -- and `push` names it as such; the remedy
-is to rerun with the sandbox off. `pull` fast-forwards only when
-the tree is clean, not ahead, not diverged, and has an upstream. `clone`
-brings a memory repository down; `disable` removes the marker. The network
-verbs time out after 30 seconds. The engine never reads memory content,
-never merges, and never touches `keys/`. It needs git 2.25 or newer.
+one commit. With `--remote`, `enable` also pushes that initial commit.
+
+`push` and `pull --agent NAME` commit only what the allowlist selects, fetch,
+rebase local commits onto upstream when behind, then push. Anything else
+staged stays staged and uncommitted. If unrelated changes remain when an
+update is needed, the command reports the paths and stops without stashing
+them. A rebase conflict aborts, names the conflicting paths, and retains the
+local commit; differing same-path additions are never automatically resolved.
+Identical additions already upstream need no duplicate commit after rebase.
+Local merge commits require manual integration so their resolutions cannot
+be lost. An existing Git operation must be finished before either verb can run.
+
+A plain `pull` updates a clean home and reports any commits still ahead;
+a dirty home requires `--agent NAME`. `startup --pull` supplies its runtime
+name as the agent, so SessionStart can also resolve dirty, behind homes.
+A failed fetch or rejected push leaves newly committed work local. A credential
+helper blocked by the sandbox is reported separately; rerun with the sandbox
+off. `clone` brings a memory repository down; `disable` removes the marker.
+Network and rebase operations time out after 30 seconds. The engine does not
+read memory content directly and never touches `keys/`. It needs git 2.25 or newer.
 
 ## Archive and restore
 
@@ -142,7 +151,7 @@ edited, never written through a symlink, and recorded in the receipt.
 `startup --runtime <claude|codex>` prints the session-start manifest: the
 project's four active files, then the three curated org files, each with its
 readability, size and modification time, and where the sync stands; with
-`--pull` it fast-forwards the home first, and the files are described as
+`--pull` it commits and syncs the home under the runtime identity first, and the files are described as
 the pull left them. `events/`, `debriefs/` and `archive/` are excluded. No
 content is included and no file is claimed as read
 (`content_injected: false`); the text, notice included, is cut at a

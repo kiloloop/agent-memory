@@ -4,6 +4,12 @@ All notable changes to agent-memory are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.3 - 2026-09-29
+
+### Fixed
+
+- `pull`, `push`, and SessionStart sync can resolve homes with local memory changes behind upstream ([sync](docs/commands.md#sync)).
+
 ## 0.1.2 - 2026-09-17
 
 ### Added
