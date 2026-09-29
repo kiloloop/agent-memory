@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     clone_ = add("clone", _clone, "Clone a memory repository into the home.")
     clone_.add_argument("url", help="git remote URL to clone")
     clone_.add_argument("--force", action="store_true", help="move a non-empty home aside before cloning")
-    add("pull", _pull, "Fast-forward the home from its upstream when the tree is clean and not ahead.")
+    add("pull", _pull, "Update from upstream; with --agent, commit allowlisted changes and deliver them too.", agent)
     add("push", _push, "Commit the allowlisted memory changes and push them when a remote exists.", agent)
     add("disable", _disable, "Remove the sync marker; the repository stays in place.")
     for name, handler, help_text, positional, positional_help in (
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         "startup",
         _startup,
         "Print the session-start manifest: the memory files to read, in order, with their readability, size and "
-        "age, and where the sync stands. Content is never included. With --pull, fast-forward the home first.",
+        "age, and where the sync stands. Content is never included. With --pull, commit and sync memory under the runtime identity first.",
     )
     startup_.add_argument("--runtime", choices=startup.RUNTIMES, required=True, help="shape the output for this runtime's hook")
     startup_.add_argument("--project", metavar="ID", help="the project tier to list (default: the one the binding or marker names)")
@@ -297,7 +297,7 @@ def _clone(args: argparse.Namespace) -> int:
 
 
 def _pull(args: argparse.Namespace) -> int:
-    return _report(sync.pull(resolve_home(args.home).path))
+    return _report(sync.pull(resolve_home(args.home).path, agent=args.agent))
 
 
 def _push(args: argparse.Namespace) -> int:

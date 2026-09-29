@@ -382,3 +382,25 @@ def test_cli_startup_project_flag_wins_over_the_binding(home: Path, isolated: Pa
     manifest = json.loads(capsys.readouterr().out)
     assert manifest["project"] == "other" and manifest["project_source"] == "flag"
     assert [entry["state"] for entry in manifest["files"][:4]] == [MISSING] * 4
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_session_start_resolves_dirty_behind_home(home: Path, tmp_path: Path, git_env: None, runtime: str) -> None:
+    # Realistic sync layout with synthetic files and identities only.
+    from conftest import git, write
+    remote = tmp_path / "remote.git"
+    git("init", "--bare", "--quiet", str(remote), cwd=tmp_path)
+    assert sync.init(home, remote=str(remote)).ok
+    peer = tmp_path / "peer"
+    git("clone", "--quiet", str(remote), str(peer), cwd=tmp_path)
+    write(peer / "org-memory/events/peer.md", "peer content\n")
+    git("add", "org-memory/events/peer.md", cwd=peer)
+    git("commit", "-qm", "peer addition", cwd=peer)
+    git("push", cwd=peer)
+    write(home / "org-memory/events/local.md", "local content\n")
+    manifest = build_manifest(home, runtime=runtime, project="demo", pull=True)
+    assert manifest["pull"]["status"] == "pushed" and manifest["pull"]["ok"]
+    assert manifest["result"] == "ok"
+    assert git("status", "--porcelain", cwd=home) == ""
+    assert git("log", "-1", "--format=%s", cwd=home).startswith(f"memory: {runtime}@")
+    assert git("--git-dir", str(remote), "show", "main:org-memory/events/local.md", cwd=tmp_path) == "local content"

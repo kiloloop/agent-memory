@@ -4,8 +4,7 @@
 
 The engine owns the sync marker, the managed block of the home's
 ``.gitignore``, the git state readout and the verbs ``init``, ``clone``,
-``pull``, ``push`` and ``disable``. It never reads memory content, never
-merges and never touches ``keys/``.
+``pull``, ``push`` and ``disable``. It never reads memory content directly and never touches ``keys/``.
 
 The publication boundary
 ------------------------
@@ -27,10 +26,10 @@ except the ones an earlier block carried and the current one retired, and
 every write comes back with a before/after receipt that names them.
 
 The network verbs (fetch, pull, push, clone) run under a 30 s timeout.
-``pull`` fast-forwards only when the tree is clean, not ahead, not diverged
-and an upstream exists. ``push`` refuses a repository that is behind or
-diverged, and a push the remote rejects leaves the local commit in place and
-says so: a local-only commit and remote delivery are distinct outcomes.
+``push`` and ``pull --agent`` commit allowlisted changes before fetching,
+rebase when behind, then deliver. A clean ``pull`` without an agent updates
+and reports unpushed commits. Conflicts abort the rebase and keep local
+commits; rejected delivery also leaves them local.
 """
 
 from __future__ import annotations
@@ -350,39 +349,43 @@ def clone(home: Path, url: str, *, force: bool = False, runner: Optional[GitRunn
     )
 
 
-def pull(home: Path, *, runner: Optional[GitRunner] = None) -> Outcome:
-    """Fast-forward ``home`` from its upstream when that is the only thing that could happen.
+def pull(
+    home: Path,
+    *,
+    agent: Optional[str] = None,
+    runner: Optional[GitRunner] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Outcome:
+    """Update the home, publishing dirty memory only with an explicit identity.
 
-    Silent on a home that is not configured for sync. Every state that rules
-    a fast-forward out (a failed fetch, a dirty tree, divergence) is its own
-    status and not a success; being ahead or having no upstream is reported
-    and is not an error.
+    Clean pulls keep their read-mostly behavior: fast-forward, or rebase local
+    commits and report ahead. An explicit agent permits dirty publication/delivery;
+    SessionStart supplies its runtime name through this same entry point.
     """
     home = _home(home)
     if not is_configured(home):
         return Outcome("not_configured", True)
     _require_repo(home, runner)
+    if _operation_in_progress(home, runner):
+        return Outcome("operation_in_progress", False, ("memory pull: a git operation is in progress; finish it first.",))
+    if changed_paths(home, runner):
+        if agent:
+            return _sync_changes(home, agent=agent, runner=runner, env=env)
+        return Outcome("dirty", False, ("memory pull: uncommitted changes present; pass --agent NAME to commit and sync.",))
     state = git_state(home, runner=runner, fetch=True)
     if not state.has_remote:
         return Outcome("local_only", True, ("memory pull: local-only repository; no remote to pull from.",))
     if state.fetch_failed:
         return _fetch_failure(state, "memory pull")
-    if state.dirty:
-        return Outcome("dirty", False, ("memory pull: uncommitted changes present; not pulling.",))
-    if state.diverged:
-        return Outcome("diverged", False, ("memory pull: diverged from upstream; resolve manually.",))
     if not state.has_upstream:
         return Outcome("no_upstream", True, ("memory pull: no upstream branch configured; skipping.",))
-    if state.ahead:
-        return Outcome("ahead", True, (f"memory pull: {state.ahead} unpushed commit(s); nothing to pull.",))
-    if not state.behind:
-        return Outcome("up_to_date", True, ("memory pull: already synced.",))
-    result = _git(home, ["pull", "--ff-only", "--quiet"], runner, timeout=NETWORK_TIMEOUT_SECONDS)
-    if result.timed_out:
-        return Outcome("pull_timed_out", False, (f"memory pull: {result.output}",))
-    if not result.ok:
-        return Outcome("pull_failed", False, (f"memory pull: fast-forward failed: {result.output}",))
-    return Outcome("synced", True, (f"memory pull: synced {state.behind} commit(s).",))
+    updated = _update(home, state, runner)
+    if not updated.ok:
+        return updated
+    current = git_state(home, runner=runner, fetch=False) if state.behind else state
+    if current.ahead:
+        return Outcome("ahead", True, (*updated.lines, f"memory pull: {current.ahead} unpushed commit(s); use push to deliver."))
+    return updated
 
 
 def push(
@@ -392,34 +395,91 @@ def push(
     runner: Optional[GitRunner] = None,
     env: Optional[Mapping[str, str]] = None,
 ) -> Outcome:
-    """Commit the allowlisted memory changes and deliver them when a remote exists.
-
-    Silent on a home that is not configured for sync. A home that is behind
-    or diverged is refused before anything is committed. A commit that could
-    not be delivered -- no remote, an unreachable one, a rejected push -- is
-    reported as such, distinctly from delivery; a credential helper a sandbox
-    blocked is named as its own cause, not as a rejection.
-    """
+    """Commit allowlisted changes, update from upstream, and deliver to the remote."""
     home = _home(home)
     if not is_configured(home):
         return Outcome("not_configured", True)
     _require_repo(home, runner)
-    state = git_state(home, runner=runner, fetch=True)
-    if state.has_remote and not state.fetch_failed:
-        if state.diverged:
-            return Outcome("diverged", False, ("memory push: diverged from upstream; resolve manually before pushing.",))
-        if state.behind:
-            return Outcome(
-                "behind", False, (f"memory push: behind upstream by {state.behind} commit(s); pull before pushing.",)
-            )
+    if _operation_in_progress(home, runner):
+        return Outcome("operation_in_progress", False, ("memory push: a git operation is in progress; finish it first.",))
+    return _sync_changes(home, agent=agent, runner=runner, env=env)
+
+
+def _operation_in_progress(home: Path, runner: Optional[GitRunner]) -> bool:
+    # Never abort or publish into an operation started by somebody else.
+    for name in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+        result = _git(home, ["rev-parse", "--git-path", name], runner)
+        if not result.ok:
+            raise SyncError(f"cannot inspect git operation state: {result.output}")
+        path = result.stdout.strip()
+        if path and (home / path).exists():
+            return True
+    return False
+
+
+def _sync_changes(
+    home: Path, *, agent: Optional[str], runner: Optional[GitRunner], env: Optional[Mapping[str, str]]
+) -> Outcome:
     published = _publish(home, agent=agent, runner=runner, env=env)
     if not published.ok:
         return published
+    # Commit before fetch: even a network failure leaves a recoverable local commit.
+    state = git_state(home, runner=runner, fetch=True)
     lines = list(published.lines)
     if not state.has_remote:
         lines.append("memory push: no remote configured; the commit remains local.")
         return Outcome("local_only", True, tuple(lines), published.committed, published.preserved)
+    if not state.fetch_failed and state.has_upstream and state.behind:
+        updated = _update(home, state, runner)
+        lines.extend(updated.lines)
+        if not updated.ok:
+            return Outcome(updated.status, False, tuple(lines), published.committed, published.preserved)
+        state = git_state(home, runner=runner, fetch=False)
     return _deliver(home, published, state, lines, runner)
+
+
+def _update(home: Path, state: GitState, runner: Optional[GitRunner]) -> Outcome:
+    if not state.behind:
+        return Outcome("up_to_date", True, ("memory pull: already synced.",))
+    remaining = changed_paths(home, runner)
+    if remaining:
+        return Outcome("dirty", False, (
+            "memory pull: cannot update with remaining uncommitted paths; left untouched: " + ", ".join(remaining),
+        ))
+    if not state.ahead:
+        result = _git(home, ["pull", "--ff-only", "--quiet"], runner, timeout=NETWORK_TIMEOUT_SECONDS)
+        if result.timed_out:
+            return Outcome("pull_timed_out", False, (f"memory pull: {result.output}",))
+        if not result.ok:
+            return Outcome("pull_failed", False, (f"memory pull: fast-forward failed: {result.output}",))
+        return Outcome("synced", True, (f"memory pull: synced {state.behind} commit(s).",))
+    merges = _git(home, ["rev-list", "--merges", f"{state.upstream}..HEAD"], runner)
+    if not merges.ok or merges.stdout.strip():
+        return Outcome("diverged", False, (
+            "memory pull: local merge commits cannot be safely rebased automatically; resolve manually."
+            if merges.ok else f"memory pull: cannot inspect local history: {merges.output}",
+        ))
+    # Rebase exactly the fetched upstream. Do not stash unrelated edits or reuse
+    # a recorded conflict resolution: a conflicting same-path add must surface.
+    result = _git(home, ["-c", "rerere.enabled=false", "-c", "rebase.updateRefs=false",
+                        "rebase", "--no-autostash", state.upstream],
+                  runner, timeout=NETWORK_TIMEOUT_SECONDS)
+    if result.ok:
+        return Outcome("synced", True, ("memory pull: rebased local commits onto upstream.",))
+    conflicts = _git(home, ["diff", "--name-only", "--diff-filter=U", "-z"], runner)
+    paths = [path for path in conflicts.stdout.split("\0") if path] if conflicts.ok else []
+    if _operation_in_progress(home, runner):
+        aborted = _git(home, ["rebase", "--abort"], runner, timeout=NETWORK_TIMEOUT_SECONDS)
+        if not aborted.ok or _operation_in_progress(home, runner):
+            return Outcome("rebase_abort_failed", False, (
+                f"memory pull: rebase failed and could not be aborted; manual recovery required. {aborted.output}",
+            ))
+    detail = ", ".join(paths) if paths else result.output
+    status = "pull_timed_out" if result.timed_out else "diverged"
+    return Outcome(status, False, (
+        f"memory pull: {'rebase timed out' if result.timed_out else 'rebase failed'}; "
+        f"local commits retained. Conflicting paths or git error: {detail}",
+    ))
 
 
 def disable(home: Path) -> Outcome:
@@ -552,9 +612,9 @@ def _deliver(
         failure = _fetch_failure(state, "memory push")
         lines.append(f"{failure.lines[0]} The commit remains local.")
         return Outcome(failure.status, False, tuple(lines), published.committed, published.preserved, receipt)
-    if not published.committed and state.has_upstream and not state.ahead:
+    if state.has_upstream and not state.ahead:
         lines.append("memory push: remote already up to date.")
-        return Outcome("up_to_date", True, tuple(lines), (), published.preserved, receipt)
+        return Outcome("up_to_date", True, tuple(lines), published.committed, published.preserved, receipt)
     result = _push_remote(home, state, runner)
     if not result.ok:
         if credential_helper_blocked(result.output):
