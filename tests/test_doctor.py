@@ -268,37 +268,37 @@ def test_a_store_that_cannot_be_inspected_is_an_error_not_uninitialized(tmp_path
 
 
 def test_directory_classification_failure_surfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # An is_symlink failure on a directory entry is reported, never raised.
+    # An lstat failure on a directory entry is reported, never raised.
     root = tmp_path / "home"
     root.mkdir()
     _write_debrief(root)
-    real_is_symlink = Path.is_symlink
+    real_lstat = os.lstat
 
-    def flaky(self: Path) -> bool:
-        if self.name == "demo-project":
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_is_symlink(self)
+    def flaky(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if isinstance(path, (str, os.PathLike)) and Path(path).name == "demo-project":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "is_symlink", flaky)
+    monkeypatch.setattr(os, "lstat", flaky)
     cat = check_org_memory(root)
     assert ("debriefs-unreadable", Severity.error) in _rows(cat)
     assert not any(r.name == "debriefs-layout" and "empty store" in r.message for r in cat.results)
 
 
 def test_record_classification_failure_surfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A stat failure while classifying a record lands in the unreadable row; other records still pass.
+    # An lstat failure while classifying a record lands in the unreadable row; other records still pass.
     root = tmp_path / "home"
     root.mkdir()
     _write_debrief(root)
     victim = _write_debrief(root, "20260825-bob-77aa88bb.md")
-    real_stat = Path.stat
+    real_lstat = os.lstat
 
-    def flaky(self: Path, *args: object, **kwargs: object) -> os.stat_result:
-        if self.name == victim.name:
-            raise PermissionError(13, "Permission denied", str(self))
-        return real_stat(self, *args, **kwargs)
+    def flaky(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if isinstance(path, (str, os.PathLike)) and Path(path).name == victim.name:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", flaky)
+    monkeypatch.setattr(os, "lstat", flaky)
     rows = _org_rows(root)
     assert ("debriefs-unreadable", Severity.error) in rows
     assert ("debriefs-layout", Severity.ok) in rows
@@ -836,7 +836,11 @@ def test_report_points_at_memory_lint_only_when_it_is_on_path(tmp_path: Path) ->
     assert doctor.to_json(categories, memory_lint="/opt/bin/memory-lint")["memory_lint"] == "/opt/bin/memory-lint"
 
 
-def test_cli_exit_codes_follow_the_error_rows(tmp_path: Path, git_env: None, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_exit_codes_follow_the_error_rows(
+    tmp_path: Path, git_env: None, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The verdict is the last line only without the memory-lint pointer, so pin the lookup off the host's PATH.
+    monkeypatch.setattr(doctor, "find_memory_lint", lambda: None)
     home, _ = synced_home(tmp_path)
     assert main(["doctor", "--home", str(home)]) == 0
     assert capsys.readouterr().out.rstrip("\n").endswith("No issues found.")

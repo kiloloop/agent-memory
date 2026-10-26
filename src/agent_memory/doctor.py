@@ -237,7 +237,7 @@ def check_org_memory(home: Path) -> Category:
         for name in sorted(dirnames):
             entry = current / name
             try:
-                is_link = entry.is_symlink()
+                is_link = stat.S_ISLNK(os.lstat(entry).st_mode)
             except OSError as exc:
                 walk_errors.append(f"{_relative(entry)}: {exc.__class__.__name__}")
                 continue
@@ -258,16 +258,18 @@ def check_org_memory(home: Path) -> Category:
             staging.append(rel)
             continue
         # The namespace holds regular files reached without following links;
-        # a classification failure surfaces, never raises.
+        # a classification failure surfaces, never raises. lstat, not the
+        # pathlib predicates: since Python 3.14 those answer False on any
+        # OSError, so a record that could not be inspected would read as irregular.
         try:
-            if file_path.is_symlink():
-                irregular.append(f"{rel} (symlink)")
-                continue
-            regular = file_path.is_file()
+            mode = os.lstat(file_path).st_mode
         except OSError as exc:
             walk_errors.append(f"{rel}: {exc.__class__.__name__}")
             continue
-        if not regular:
+        if stat.S_ISLNK(mode):
+            irregular.append(f"{rel} (symlink)")
+            continue
+        if not stat.S_ISREG(mode):
             irregular.append(f"{rel} (not a regular file)")
             continue
         total += 1

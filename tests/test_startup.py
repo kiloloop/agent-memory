@@ -25,6 +25,7 @@ from agent_memory.startup import (
     MISSING,
     READABLE,
     UNREADABLE,
+    author_of,
     build_manifest,
     render_codex_hook,
     render_text,
@@ -404,3 +405,80 @@ def test_session_start_resolves_dirty_behind_home(home: Path, tmp_path: Path, gi
     assert git("status", "--porcelain", cwd=home) == ""
     assert git("log", "-1", "--format=%s", cwd=home).startswith(f"memory: {runtime}@")
     assert git("--git-dir", str(remote), "show", "main:org-memory/events/local.md", cwd=tmp_path) == "local content"
+
+
+@pytest.mark.parametrize(
+    ("relative", "author"),
+    [
+        ("org-memory/debriefs/demo/2026/10/20261018-claude-ab12cd34.md", "claude"),
+        ("org-memory/debriefs/demo/2026/10/20261018-bob-ops-9f00aa11.md", "bob-ops"),
+        ("org-memory/debriefs/demo/2026/10/20261018-claude-AB12.md", None),
+        ("org-memory/debriefs/demo/20261018-claude-ab12cd34.md", None),
+        ("org-memory/events/20261018-120000-peer-rule.md", "codex"),
+        ("org-memory/events/20261018-120001-no-frontmatter.md", None),
+        ("org-memory/events/20261018-120002-missing.md", None),
+        ("org-memory/recent.md", None),
+        ("projects/demo/memory/open_threads.md", None),
+    ],
+)
+def test_author_of_reads_debrief_names_and_event_frontmatter(home: Path, relative: str, author: str) -> None:
+    from conftest import write
+    write(home / "org-memory/events/20261018-120000-peer-rule.md", "---\ncreated_at_utc: x\nagent: codex\n---\n\nbody\n")
+    write(home / "org-memory/events/20261018-120001-no-frontmatter.md", "just text\n")
+    assert author_of(home, relative) == author
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_session_start_holds_another_agents_paths_and_still_pulls(
+    home: Path, tmp_path: Path, git_env: None, runtime: str
+) -> None:
+    # Synthetic files and identities only.
+    from conftest import git, write
+    peer_name = "codex" if runtime == "claude" else "claude"
+    remote = tmp_path / "remote.git"
+    git("init", "--bare", "--quiet", str(remote), cwd=tmp_path)
+    assert sync.init(home, remote=str(remote)).ok
+    peer = tmp_path / "peer"
+    git("clone", "--quiet", str(remote), str(peer), cwd=tmp_path)
+    write(peer / "org-memory/events/upstream.md", "upstream content\n")
+    git("add", "org-memory/events/upstream.md", cwd=peer)
+    git("commit", "-qm", "peer addition", cwd=peer)
+    git("push", cwd=peer)
+
+    peer_debrief = f"org-memory/debriefs/demo/2026/10/20261018-{peer_name}-ab12cd34.md"
+    peer_event = "org-memory/events/20261018-120000-peer-rule.md"
+    own_debrief = f"org-memory/debriefs/demo/2026/10/20261018-{runtime}-ef56ab78.md"
+    write(home / peer_debrief, "peer debrief\n")
+    write(home / peer_event, f"---\ncreated_at_utc: x\nagent: {peer_name}\n---\n\nbody\n")
+    write(home / own_debrief, "own debrief\n")
+    write(home / "projects/demo/memory/open_threads.md", "unattributed edit\n")
+
+    manifest = build_manifest(home, runtime=runtime, project="demo", pull=True)
+    assert manifest["pull"]["status"] == "pushed" and manifest["pull"]["ok"], manifest["pull"]
+    assert any("another agent wrote left for it to publish" in line for line in manifest["pull"]["lines"])
+    assert (home / "org-memory/events/upstream.md").read_text() == "upstream content\n"
+    assert sorted(git("ls-files", "--others", "--exclude-standard", cwd=home).splitlines()) == sorted([peer_debrief, peer_event])
+    published = git("--git-dir", str(remote), "ls-tree", "-r", "--name-only", "main", cwd=tmp_path).splitlines()
+    assert own_debrief in published and "projects/demo/memory/open_threads.md" in published
+    assert peer_debrief not in published and peer_event not in published
+
+
+def test_session_start_with_only_held_paths_still_fast_forwards(home: Path, tmp_path: Path, git_env: None) -> None:
+    from conftest import git, write
+    remote = tmp_path / "remote.git"
+    git("init", "--bare", "--quiet", str(remote), cwd=tmp_path)
+    assert sync.init(home, remote=str(remote)).ok
+    peer = tmp_path / "peer"
+    git("clone", "--quiet", str(remote), str(peer), cwd=tmp_path)
+    write(peer / "org-memory/events/upstream.md", "upstream content\n")
+    git("add", "org-memory/events/upstream.md", cwd=peer)
+    git("commit", "-qm", "peer addition", cwd=peer)
+    git("push", cwd=peer)
+    held = "org-memory/debriefs/demo/2026/10/20261018-codex-ab12cd34.md"
+    write(home / held, "peer debrief\n")
+    head = git("rev-parse", "HEAD", cwd=home)
+
+    manifest = build_manifest(home, runtime="claude", project="demo", pull=True)
+    assert manifest["pull"]["ok"] and manifest["result"] == "ok", manifest["pull"]
+    assert git("rev-parse", "HEAD", cwd=home) == git("--git-dir", str(remote), "rev-parse", "main", cwd=tmp_path) != head
+    assert git("status", "--porcelain", "--untracked-files=all", cwd=home) == f"?? {held}"

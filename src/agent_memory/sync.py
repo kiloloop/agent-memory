@@ -29,7 +29,17 @@ The network verbs (fetch, pull, push, clone) run under a 30 s timeout.
 ``push`` and ``pull --agent`` commit allowlisted changes before fetching,
 rebase when behind, then deliver. A clean ``pull`` without an agent updates
 and reports unpushed commits. Conflicts abort the rebase and keep local
-commits; rejected delivery also leaves them local.
+commits; rejected delivery also leaves them local. ``pull`` takes a hold
+predicate from its caller: a selected path it holds is left uncommitted for
+whoever wrote it, which keeps the engine content-blind when the predicate
+has to read a file to name its author. An update never moves a tracked
+change, but an untracked path the incoming commits do not touch rides
+through the fast-forward or rebase in place.
+
+``pull`` and ``push`` hold an exclusive lock under the git directory, so one
+of them syncs a home at a time and a second waits for the first. A rebase
+found in progress is never this verb's to abort: one is refused before
+anything is written, and checked for again just before the verb's own rebase.
 """
 
 from __future__ import annotations
@@ -39,18 +49,34 @@ import os
 import shutil
 import socket
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from . import layout
 from .git_runner import GitResult, GitRunner, run_git
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - no flock here; the in-progress checks still apply
+    fcntl = None  # type: ignore[assignment]
 
 MARKER_FILE = layout.MARKER_FILE
 GITIGNORE_FILE = layout.GITIGNORE_FILE
 MARKER_TEXT = "agent-memory sync repository. Remove this file to disable syncing locally.\n"
 NETWORK_TIMEOUT_SECONDS = 30
 DEFAULT_REMOTE = "origin"
+#: The branch a new memory repository starts on, whatever git's local ``init.defaultBranch`` says.
+DEFAULT_BRANCH = "main"
+
+#: The sync lock, a file under the git directory that ``pull`` and ``push`` hold with flock.
+LOCK_FILE = "agent-memory-sync.lock"
+#: How long a verb waits for another sync of the same home: the longest a holder can
+#: run is its four network-bounded steps (fetch, rebase, abort, push).
+LOCK_WAIT_SECONDS: float = 4 * NETWORK_TIMEOUT_SECONDS
+_LOCK_POLL_SECONDS = 0.1
 
 #: The agent name a commit is published under, when the caller does not pass one.
 ENV_AGENT = "AGENT_MEMORY_AGENT"
@@ -148,6 +174,8 @@ class Outcome:
     #: Paths that were staged outside the selection and were left exactly as found.
     preserved: Tuple[str, ...] = ()
     receipt: Optional[GitignoreReceipt] = None
+    #: Selected paths the caller's hold predicate kept out of the commit, home-relative.
+    held: Tuple[str, ...] = ()
 
 
 # --- marker and ignore file -------------------------------------------------
@@ -293,6 +321,10 @@ def init(
         result = _git(home, ["init", "--quiet"], runner)
         if not result.ok:
             raise SyncError(f"git init failed: {result.output}")
+        # Name the unborn branch here rather than with --initial-branch, which needs git 2.28.
+        result = _git(home, ["symbolic-ref", "HEAD", f"refs/heads/{DEFAULT_BRANCH}"], runner)
+        if not result.ok:
+            raise SyncError(f"git symbolic-ref failed: {result.output}")
     receipt = ensure_gitignore(home)
     lines = receipt.lines()
     if write_marker(home):
@@ -355,37 +387,44 @@ def pull(
     agent: Optional[str] = None,
     runner: Optional[GitRunner] = None,
     env: Optional[Mapping[str, str]] = None,
+    hold: Optional[Callable[[str], bool]] = None,
 ) -> Outcome:
     """Update the home, publishing dirty memory only with an explicit identity.
 
     Clean pulls keep their read-mostly behavior: fast-forward, or rebase local
     commits and report ahead. An explicit agent permits dirty publication/delivery;
-    SessionStart supplies its runtime name through this same entry point.
+    SessionStart supplies its runtime name through this same entry point, with a
+    ``hold`` predicate that keeps another agent's pending paths out of the commit.
     """
     home = _home(home)
     if not is_configured(home):
         return Outcome("not_configured", True)
     _require_repo(home, runner)
-    if _operation_in_progress(home, runner):
-        return Outcome("operation_in_progress", False, ("memory pull: a git operation is in progress; finish it first.",))
-    if changed_paths(home, runner):
-        if agent:
-            return _sync_changes(home, agent=agent, runner=runner, env=env)
-        return Outcome("dirty", False, ("memory pull: uncommitted changes present; pass --agent NAME to commit and sync.",))
-    state = git_state(home, runner=runner, fetch=True)
-    if not state.has_remote:
-        return Outcome("local_only", True, ("memory pull: local-only repository; no remote to pull from.",))
-    if state.fetch_failed:
-        return _fetch_failure(state, "memory pull")
-    if not state.has_upstream:
-        return Outcome("no_upstream", True, ("memory pull: no upstream branch configured; skipping.",))
-    updated = _update(home, state, runner)
-    if not updated.ok:
+    with _sync_lock(home, runner, "memory pull") as busy:
+        if busy:
+            return busy
+        if _operation_in_progress(home, runner):
+            return Outcome("operation_in_progress", False, ("memory pull: a git operation is in progress; finish it first.",))
+        if changed_paths(home, runner):
+            if agent:
+                return _sync_changes(home, agent=agent, runner=runner, env=env, hold=hold)
+            return Outcome("dirty", False, ("memory pull: uncommitted changes present; pass --agent NAME to commit and sync.",))
+        state = git_state(home, runner=runner, fetch=True)
+        if not state.has_remote:
+            return Outcome("local_only", True, ("memory pull: local-only repository; no remote to pull from.",))
+        if state.fetch_failed:
+            return _fetch_failure(state, "memory pull")
+        if not state.has_upstream:
+            return Outcome("no_upstream", True, ("memory pull: no upstream branch configured; skipping.",))
+        updated = _update(home, state, runner)
+        if not updated.ok:
+            return updated
+        current = git_state(home, runner=runner, fetch=False) if state.behind else state
+        if current.ahead:
+            # Nothing came down unless it was behind; "already synced" would contradict the count.
+            pulled = updated.lines if state.behind else ()
+            return Outcome("ahead", True, (*pulled, f"memory pull: {current.ahead} unpushed commit(s); use push to deliver."))
         return updated
-    current = git_state(home, runner=runner, fetch=False) if state.behind else state
-    if current.ahead:
-        return Outcome("ahead", True, (*updated.lines, f"memory pull: {current.ahead} unpushed commit(s); use push to deliver."))
-    return updated
 
 
 def push(
@@ -400,9 +439,49 @@ def push(
     if not is_configured(home):
         return Outcome("not_configured", True)
     _require_repo(home, runner)
-    if _operation_in_progress(home, runner):
-        return Outcome("operation_in_progress", False, ("memory push: a git operation is in progress; finish it first.",))
-    return _sync_changes(home, agent=agent, runner=runner, env=env)
+    with _sync_lock(home, runner, "memory push") as busy:
+        if busy:
+            return busy
+        if _operation_in_progress(home, runner):
+            return Outcome("operation_in_progress", False, ("memory push: a git operation is in progress; finish it first.",))
+        return _sync_changes(home, agent=agent, runner=runner, env=env)
+
+
+@contextmanager
+def _sync_lock(home: Path, runner: Optional[GitRunner], verb: str) -> Iterator[Optional[Outcome]]:
+    """Hold the home's sync lock; yield ``None``, or the outcome to return when another sync kept it.
+
+    flock belongs to the open file, so the kernel releases it when the holder exits,
+    however it exits: a crashed sync never leaves the home locked. The file stays.
+    """
+    if fcntl is None:  # pragma: no cover
+        yield None
+        return
+    result = _git(home, ["rev-parse", "--git-path", LOCK_FILE], runner)
+    if not result.ok or not result.stdout.strip():
+        raise SyncError(f"cannot locate the git directory for the sync lock: {result.output}")
+    fd = os.open(home / result.stdout.strip(), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        if _flock_within(fd, LOCK_WAIT_SECONDS):
+            yield None
+        else:
+            yield Outcome("sync_in_progress", False, (
+                f"{verb}: another agent-memory sync held this home for {LOCK_WAIT_SECONDS:g}s; nothing was changed.",
+            ))
+    finally:
+        os.close(fd)
+
+
+def _flock_within(fd: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 def _operation_in_progress(home: Path, runner: Optional[GitRunner]) -> bool:
@@ -418,9 +497,14 @@ def _operation_in_progress(home: Path, runner: Optional[GitRunner]) -> bool:
 
 
 def _sync_changes(
-    home: Path, *, agent: Optional[str], runner: Optional[GitRunner], env: Optional[Mapping[str, str]]
+    home: Path,
+    *,
+    agent: Optional[str],
+    runner: Optional[GitRunner],
+    env: Optional[Mapping[str, str]],
+    hold: Optional[Callable[[str], bool]] = None,
 ) -> Outcome:
-    published = _publish(home, agent=agent, runner=runner, env=env)
+    published = _publish(home, agent=agent, runner=runner, env=env, hold=hold)
     if not published.ok:
         return published
     # Commit before fetch: even a network failure leaves a recoverable local commit.
@@ -428,12 +512,14 @@ def _sync_changes(
     lines = list(published.lines)
     if not state.has_remote:
         lines.append("memory push: no remote configured; the commit remains local.")
-        return Outcome("local_only", True, tuple(lines), published.committed, published.preserved)
+        return Outcome("local_only", True, tuple(lines), published.committed, published.preserved,
+                       held=published.held)
     if not state.fetch_failed and state.has_upstream and state.behind:
         updated = _update(home, state, runner)
         lines.extend(updated.lines)
         if not updated.ok:
-            return Outcome(updated.status, False, tuple(lines), published.committed, published.preserved)
+            return Outcome(updated.status, False, tuple(lines), published.committed, published.preserved,
+                           held=published.held)
         state = git_state(home, runner=runner, fetch=False)
     return _deliver(home, published, state, lines, runner)
 
@@ -442,9 +528,10 @@ def _update(home: Path, state: GitState, runner: Optional[GitRunner]) -> Outcome
     if not state.behind:
         return Outcome("up_to_date", True, ("memory pull: already synced.",))
     remaining = changed_paths(home, runner)
-    if remaining:
+    blocking = _blocking_paths(home, state, remaining, runner)
+    if blocking:
         return Outcome("dirty", False, (
-            "memory pull: cannot update with remaining uncommitted paths; left untouched: " + ", ".join(remaining),
+            "memory pull: cannot update with remaining uncommitted paths; left untouched: " + ", ".join(blocking),
         ))
     if not state.ahead:
         result = _git(home, ["pull", "--ff-only", "--quiet"], runner, timeout=NETWORK_TIMEOUT_SECONDS)
@@ -452,20 +539,24 @@ def _update(home: Path, state: GitState, runner: Optional[GitRunner]) -> Outcome
             return Outcome("pull_timed_out", False, (f"memory pull: {result.output}",))
         if not result.ok:
             return Outcome("pull_failed", False, (f"memory pull: fast-forward failed: {result.output}",))
-        return Outcome("synced", True, (f"memory pull: synced {state.behind} commit(s).",))
+        return Outcome("synced", True, (f"memory pull: synced {state.behind} commit(s).", *_kept_lines(remaining)))
     merges = _git(home, ["rev-list", "--merges", f"{state.upstream}..HEAD"], runner)
     if not merges.ok or merges.stdout.strip():
         return Outcome("diverged", False, (
             "memory pull: local merge commits cannot be safely rebased automatically; resolve manually."
             if merges.ok else f"memory pull: cannot inspect local history: {merges.output}",
         ))
+    # The sync lock keeps every other agent-memory verb out; this catches a rebase another
+    # tool began after the precheck, which a failed rebase of ours would otherwise abort.
+    if _operation_in_progress(home, runner):
+        return Outcome("operation_in_progress", False, ("memory pull: a git operation began during the sync; finish it first.",))
     # Rebase exactly the fetched upstream. Do not stash unrelated edits or reuse
     # a recorded conflict resolution: a conflicting same-path add must surface.
     result = _git(home, ["-c", "rerere.enabled=false", "-c", "rebase.updateRefs=false",
                         "rebase", "--no-autostash", state.upstream],
                   runner, timeout=NETWORK_TIMEOUT_SECONDS)
     if result.ok:
-        return Outcome("synced", True, ("memory pull: rebased local commits onto upstream.",))
+        return Outcome("synced", True, ("memory pull: rebased local commits onto upstream.", *_kept_lines(remaining)))
     conflicts = _git(home, ["diff", "--name-only", "--diff-filter=U", "-z"], runner)
     paths = [path for path in conflicts.stdout.split("\0") if path] if conflicts.ok else []
     if _operation_in_progress(home, runner):
@@ -480,6 +571,38 @@ def _update(home: Path, state: GitState, runner: Optional[GitRunner]) -> Outcome
         f"memory pull: {'rebase timed out' if result.timed_out else 'rebase failed'}; "
         f"local commits retained. Conflicting paths or git error: {detail}",
     ))
+
+
+def _blocking_paths(home: Path, state: GitState, remaining: Sequence[str], runner: Optional[GitRunner]) -> List[str]:
+    """The uncommitted paths an update cannot carry: every tracked change, and any untracked
+    path that an incoming commit adds, changes or removes, itself or as a parent directory."""
+    if not remaining:
+        return []
+    untracked = set(_untracked_paths(home, runner))
+    if not untracked:
+        return list(remaining)
+    incoming = _git(home, ["diff", "--name-only", "-z", f"HEAD...{state.upstream}"], runner)
+    if not incoming.ok:
+        return list(remaining)
+    touched = [path for path in incoming.stdout.split("\0") if path]
+    return [path for path in remaining if path not in untracked or any(_overlaps(path, other) for other in touched)]
+
+
+def _overlaps(path: str, other: str) -> bool:
+    return path == other or path.startswith(f"{other}/") or other.startswith(f"{path}/")
+
+
+def _untracked_paths(home: Path, runner: Optional[GitRunner]) -> List[str]:
+    result = _git(home, ["ls-files", "--others", "--exclude-standard", "-z"], runner)
+    if not result.ok:
+        raise SyncError(f"git ls-files failed: {result.output}")
+    return [path for path in result.stdout.split("\0") if path]
+
+
+def _kept_lines(remaining: Sequence[str]) -> Tuple[str, ...]:
+    if not remaining:
+        return ()
+    return (f"memory pull: {len(remaining)} untracked path(s) left in place: {', '.join(remaining)}",)
 
 
 def disable(home: Path) -> Outcome:
@@ -559,6 +682,7 @@ def _publish(
     agent: Optional[str],
     runner: Optional[GitRunner],
     env: Optional[Mapping[str, str]],
+    hold: Optional[Callable[[str], bool]] = None,
 ) -> Outcome:
     selected, outside = select_paths(home, runner)
     if outside:
@@ -571,8 +695,14 @@ def _publish(
                 f"{', '.join(outside)}",
             ),
         )
-    preserved = tuple(sorted(set(staged_paths(home, runner)) - set(selected)))
+    held = tuple(path for path in selected if hold is not None and hold(path))
+    selected = [path for path in selected if path not in held]
+    preserved = tuple(sorted(set(staged_paths(home, runner)) - set(selected) - set(held)))
     lines: List[str] = []
+    if held:
+        lines.append(
+            f"memory publish: {len(held)} path(s) another agent wrote left for it to publish: {', '.join(held)}"
+        )
     if preserved:
         lines.append(
             f"memory publish: {len(preserved)} staged path(s) outside the allowlist left staged and "
@@ -580,22 +710,22 @@ def _publish(
         )
     if not selected:
         lines.append("memory publish: no memory changes to commit.")
-        return Outcome("nothing_to_commit", True, tuple(lines), (), preserved)
+        return Outcome("nothing_to_commit", True, tuple(lines), (), preserved, held=held)
 
     message = commit_message(len(selected), resolve_agent(agent, env))
     with _pathspec_file(selected) as pathspec:
         added = _git(home, ["--literal-pathspecs", "add", *_from_file(pathspec)], runner)
         if not added.ok:
-            return Outcome("commit_failed", False, (*lines, f"memory publish: git add failed: {added.output}"))
+            return Outcome("commit_failed", False, (*lines, f"memory publish: git add failed: {added.output}"), held=held)
         committed = _git(home, ["--literal-pathspecs", "commit", "--quiet", "-m", message, *_from_file(pathspec)], runner)
     if not committed.ok:
-        return Outcome("commit_failed", False, (*lines, f"memory publish: git commit failed: {committed.output}"))
+        return Outcome("commit_failed", False, (*lines, f"memory publish: git commit failed: {committed.output}"), held=held)
     published = committed_paths(home, runner)
     stray = sorted(path for path in published if not layout.is_allowed_memory_path(path))
     if stray:
         raise SyncError(f"memory publish: HEAD commits paths outside the allowlist: {', '.join(stray)}")
     lines.append(f"memory publish: committed {len(published)} file(s).")
-    return Outcome("committed", True, tuple(lines), tuple(published), preserved)
+    return Outcome("committed", True, tuple(lines), tuple(published), preserved, held=held)
 
 
 def _deliver(
@@ -611,10 +741,12 @@ def _deliver(
             return _helper_blocked(lines, published, receipt)
         failure = _fetch_failure(state, "memory push")
         lines.append(f"{failure.lines[0]} The commit remains local.")
-        return Outcome(failure.status, False, tuple(lines), published.committed, published.preserved, receipt)
+        return Outcome(failure.status, False, tuple(lines), published.committed, published.preserved, receipt,
+                       held=published.held)
     if state.has_upstream and not state.ahead:
         lines.append("memory push: remote already up to date.")
-        return Outcome("up_to_date", True, tuple(lines), published.committed, published.preserved, receipt)
+        return Outcome("up_to_date", True, tuple(lines), published.committed, published.preserved, receipt,
+                       held=published.held)
     result = _push_remote(home, state, runner)
     if not result.ok:
         if credential_helper_blocked(result.output):
@@ -622,9 +754,11 @@ def _deliver(
         what = "timed out" if result.timed_out else "was rejected"
         lines.append(f"memory push: the push {what}; the commit remains local. {result.output}".rstrip())
         status = "push_timed_out" if result.timed_out else "push_failed"
-        return Outcome(status, False, tuple(lines), published.committed, published.preserved, receipt)
+        return Outcome(status, False, tuple(lines), published.committed, published.preserved, receipt,
+                       held=published.held)
     lines.append("memory push: delivered to the remote.")
-    return Outcome("pushed", True, tuple(lines), published.committed, published.preserved, receipt)
+    return Outcome("pushed", True, tuple(lines), published.committed, published.preserved, receipt,
+                       held=published.held)
 
 
 def _push_remote(home: Path, state: GitState, runner: Optional[GitRunner]) -> GitResult:
@@ -656,7 +790,8 @@ def _helper_blocked(
 ) -> Outcome:
     lines.append(_HELPER_BLOCKED_LINE)
     return Outcome(
-        "credential_helper_blocked", False, tuple(lines), published.committed, published.preserved, receipt
+        "credential_helper_blocked", False, tuple(lines), published.committed, published.preserved, receipt,
+        held=published.held,
     )
 
 

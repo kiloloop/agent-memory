@@ -74,7 +74,9 @@ credentials. `org init` is the org tier alone, for a home that already exists.
 
 ## Sync
 
-`enable` makes the home a git repository of its own, puts the sync allowlist at
+`enable` makes the home a git repository of its own on branch `main`, whatever
+git's `init.defaultBranch` says (a home that is already a repository keeps its
+branch), puts the sync allowlist at
 the head of its `.gitignore` as a managed block (existing lines are kept, lines
 an earlier block carried are retired, and the write comes with a before/after
 receipt that names them), drops the sync marker, and makes
@@ -84,15 +86,20 @@ one commit. With `--remote`, `enable` also pushes that initial commit.
 rebase local commits onto upstream when behind, then push. Anything else
 staged stays staged and uncommitted. If unrelated changes remain when an
 update is needed, the command reports the paths and stops without stashing
-them. A rebase conflict aborts, names the conflicting paths, and retains the
+them, except untracked files the incoming commits do not touch: those stay
+in place through the update and are named. A rebase conflict aborts, names the conflicting paths, and retains the
 local commit; differing same-path additions are never automatically resolved.
 Identical additions already upstream need no duplicate commit after rebase.
 Local merge commits require manual integration so their resolutions cannot
 be lost. An existing Git operation must be finished before either verb can run.
+One `pull` or `push` syncs a home at a time: a second waits up to two minutes
+for the first to finish, and neither aborts a rebase it did not start.
 
 A plain `pull` updates a clean home and reports any commits still ahead;
 a dirty home requires `--agent NAME`. `startup --pull` supplies its runtime
 name as the agent, so SessionStart can also resolve dirty, behind homes.
+It leaves out a debrief or event that names another agent as its author
+([startup](#startup)).
 A failed fetch or rejected push leaves newly committed work local. A credential
 helper blocked by the sandbox is reported separately; rerun with the sandbox
 off. `clone` brings a memory repository down; `disable` removes the marker.
@@ -152,7 +159,10 @@ edited, never written through a symlink, and recorded in the receipt.
 project's four active files, then the three curated org files, each with its
 readability, size and modification time, and where the sync stands; with
 `--pull` it commits and syncs the home under the runtime identity first, and the files are described as
-the pull left them. `events/`, `debriefs/` and `archive/` are excluded. No
+the pull left them. The pull leaves another agent's pending files for that
+agent to publish: a debrief whose filename names a different agent, or an
+event whose frontmatter `agent:` does. Files with no author (the curated
+org files, the project tier) sync as before. `events/`, `debriefs/` and `archive/` are excluded. No
 content is included and no file is claimed as read
 (`content_injected: false`); the text, notice included, is cut at a
 character budget (`--max-chars`, at least 1). The default output is what
