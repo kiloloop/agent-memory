@@ -4,6 +4,17 @@ All notable changes to agent-memory are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.4 - 2026-10-26
+
+### Fixed
+
+- `pull` and `push` sync one at a time per home and never abort a rebase they did not start ([sync](docs/commands.md#sync)).
+- `pull` with only unpushed commits no longer also reports "already synced" ([sync](docs/commands.md#sync)).
+- `startup --pull` no longer publishes a debrief or event another agent wrote ([startup](docs/commands.md#startup)).
+- `pull` and `push` update past untracked files the incoming commits do not touch, so SessionStart keeps pulling ([sync](docs/commands.md#sync)).
+- `doctor` on Python 3.14 reports a debrief record it cannot inspect as unreadable, not as an irregular file ([doctor](docs/commands.md#doctor)).
+- `enable` starts a new memory repository on `main` even where git's `init.defaultBranch` is `master` ([sync](docs/commands.md#sync)).
+
 ## 0.1.3 - 2026-09-29
 
 ### Fixed

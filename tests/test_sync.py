@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -136,11 +139,12 @@ class FetchTimesOut:
 
 def test_fetch_pull_push_and_clone_receive_network_timeouts(tmp_path: Path) -> None:
     root = tmp_path / "home"
-    root.mkdir()
+    (root / ".git").mkdir(parents=True)
     _write(root / MARKER, "memory sync enabled\n")
     common = {
         ("rev-parse", "--is-inside-work-tree"): "true",
         ("rev-parse", "--show-toplevel"): str(root),
+        ("rev-parse", "--git-path", sync.LOCK_FILE): f".git/{sync.LOCK_FILE}",
         ("remote",): "origin",
         ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): "origin/main",
     }
@@ -815,6 +819,10 @@ def test_pull_rebases_a_diverged_repository_and_reports_ahead(tmp_path: Path) ->
     outcome = sync.pull(home)
 
     assert outcome.status == "ahead" and outcome.ok
+    assert outcome.lines == (
+        "memory pull: rebased local commits onto upstream.",
+        "memory pull: 1 unpushed commit(s); use push to deliver.",
+    )
     assert (home / "org-memory" / "remote.md").exists()
 
 
@@ -829,7 +837,8 @@ def test_pull_with_unpushed_commits_is_not_an_error(tmp_path: Path) -> None:
     outcome = sync.pull(home)
 
     assert outcome.status == "ahead" and outcome.ok
-    assert "1 unpushed commit(s)" in outcome.lines[-1]
+    # Nothing came down, so no "already synced" ahead of the unpushed count.
+    assert outcome.lines == ("memory pull: 1 unpushed commit(s); use push to deliver.",)
 
 
 def test_pull_when_already_synced(tmp_path: Path) -> None:
@@ -924,6 +933,29 @@ def test_init_is_idempotent(tmp_path: Path) -> None:
     assert "no memory changes to commit" in " ".join(outcome.lines)
     assert _commit_count(home) == count
     assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file() and ".git" not in path.parts} == before
+
+
+@pytest.mark.parametrize("local_default", ["master", "main"])
+def test_init_starts_a_new_repository_on_main_whatever_the_local_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local_default: str
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", local_default)
+    home = _local_home(tmp_path)
+    assert _git("symbolic-ref", "--short", "HEAD", cwd=home) == "main"
+    assert _git("branch", "--format=%(refname:short)", cwd=home) == "main"
+
+
+def test_init_keeps_the_branch_of_an_existing_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "master")
+    home = tmp_path / "home"
+    home.mkdir()
+    _git("init", "--quiet", cwd=home)
+
+    assert sync.init(home).ok
+    assert sync.init(home).ok
+
+    assert _git("branch", "--format=%(refname:short)", cwd=home) == "master"
+    assert _head_paths(home) == [".gitignore", MARKER]
 
 
 def test_init_adds_origin_when_another_remote_exists(tmp_path: Path) -> None:
@@ -1095,6 +1127,87 @@ def test_existing_rebase_is_never_published_or_aborted(tmp_path: Path, verb) -> 
 
 
 @pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_a_rebase_begun_after_the_precheck_is_never_aborted(tmp_path: Path, verb) -> None:
+    # The in-progress precheck runs before the fetch. A rebase somebody else starts
+    # once the upstream has been read, just before ours, is theirs and must survive.
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _write(home / "org-memory/local.md", "local\n")
+    _git("add", "org-memory/local.md", cwd=home)
+    _git("commit", "-qm", "local", cwd=home)
+    _commit_and_push(seed, "org-memory/remote.md", "remote\n")
+
+    def runner(args, *, cwd, timeout=None):
+        result = run_git(args, cwd=cwd, timeout=timeout)
+        if tuple(args[:2]) == ("rev-list", "--merges"):
+            # Stops at the failing exec with a clean tree and its state directory in place.
+            assert not run_git(["rebase", "--exec", "false", "HEAD~1"], cwd=cwd).ok
+            assert (home / ".git/rebase-merge").exists()
+        return result
+
+    outcome = verb(home, agent="test-agent", runner=runner)
+    assert outcome.status == "operation_in_progress" and not outcome.ok
+    assert (home / ".git/rebase-merge").exists()
+    assert not _remote_has(remote, "org-memory/local.md")
+
+
+@contextmanager
+def _held_sync_lock(home: Path) -> Iterator[None]:
+    """Hold the home's sync lock the way a concurrent agent-memory process would."""
+    fcntl = pytest.importorskip("fcntl")
+    with open(home / ".git" / sync.LOCK_FILE, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
+def test_a_sync_held_elsewhere_past_the_wait_changes_nothing(
+    tmp_path: Path, verb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/remote.md", "remote\n")
+    _write(home / "org-memory/local.md", "local\n")
+    monkeypatch.setattr(sync, "LOCK_WAIT_SECONDS", 0.2)
+    runner = FetchTimesOut()
+
+    with _held_sync_lock(home):
+        outcome = verb(home, agent="test-agent", runner=runner)
+
+    assert outcome.status == "sync_in_progress" and not outcome.ok
+    assert "another agent-memory sync" in outcome.lines[-1]
+    assert not any(call[0] in {"fetch", "add", "commit", "rebase"} for call in runner.calls)
+    assert not (home / "org-memory/remote.md").exists()
+    assert _git("status", "--porcelain", cwd=home) == "?? org-memory/local.md"
+
+
+def test_a_second_sync_waits_for_the_first_to_finish(tmp_path: Path) -> None:
+    pytest.importorskip("fcntl")
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/remote.md", "remote\n")
+    held = threading.Event()
+
+    def first_sync() -> None:
+        with _held_sync_lock(home):
+            held.set()
+            time.sleep(0.3)
+
+    holder = threading.Thread(target=first_sync)
+    holder.start()
+    assert held.wait(timeout=10), "the first sync never took the lock"
+    started = time.monotonic()
+    outcome = sync.pull(home)
+    holder.join()
+
+    assert outcome.status == "synced" and outcome.ok
+    assert time.monotonic() - started >= 0.2, "the second sync ran alongside the first"
+
+
+@pytest.mark.parametrize("verb", [sync.pull, sync.push])
 def test_dirty_fetch_timeout_keeps_commit_and_identity(tmp_path: Path, verb) -> None:
     remote, _ = _create_remote(tmp_path)
     home = tmp_path / "home"
@@ -1181,3 +1294,53 @@ def test_local_merge_content_is_not_dropped_by_rebase(tmp_path: Path, verb) -> N
     assert "merge commits" in outcome.lines[-1]
     assert _git("rev-parse", "HEAD", cwd=home) == before
     assert (home / "org-memory/merge-only.md").read_text() == "merge resolution\n"
+
+
+# Real git shapes; all repository names, identities and contents are synthetic.
+def test_pull_holds_paths_the_predicate_names_and_updates_past_them(tmp_path: Path) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/peer.md", "peer content\n")
+    _write(home / "org-memory/held.md", "someone else's\n")
+    _write(home / "org-memory/local.md", "local content\n")
+    outcome = sync.pull(home, agent="test-agent", hold=lambda path: path == "org-memory/held.md")
+    assert outcome.ok and outcome.status == "pushed", outcome.lines
+    assert outcome.held == ("org-memory/held.md",)
+    assert outcome.committed == ("org-memory/local.md",)
+    assert _git("status", "--porcelain", cwd=home) == "?? org-memory/held.md"
+    assert _remote_has(remote, "org-memory/local.md") and not _remote_has(remote, "org-memory/held.md")
+    assert (home / "org-memory/peer.md").read_text() == "peer content\n"
+    assert any("1 untracked path(s) left in place: org-memory/held.md" in line for line in outcome.lines)
+
+
+@pytest.mark.parametrize(
+    ("held", "incoming"),
+    [("org-memory/held.md", "org-memory/held.md"), ("org-memory/held/inner.md", "org-memory/held")],
+)
+def test_an_untracked_path_the_upstream_touches_still_blocks_the_update(tmp_path: Path, held: str, incoming: str) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, incoming, "upstream\n")
+    _write(home / held, "local\n")
+    before = _git("rev-parse", "HEAD", cwd=home)
+    outcome = sync.pull(home, agent="test-agent", hold=lambda path: path == held)
+    assert outcome.status == "dirty" and not outcome.ok
+    assert outcome.lines[-1].endswith(f"left untouched: {held}")
+    assert _git("rev-parse", "HEAD", cwd=home) == before
+    assert (home / held).read_text() == "local\n"
+
+
+def test_a_tracked_change_left_behind_still_blocks_the_update(tmp_path: Path) -> None:
+    remote, seed = _create_remote(tmp_path)
+    home = tmp_path / "home"
+    sync.clone(home, str(remote))
+    _commit_and_push(seed, "org-memory/recent.md", "base\n")
+    assert sync.pull(home).ok
+    _commit_and_push(seed, "org-memory/peer.md", "peer content\n")
+    _write(home / "org-memory/recent.md", "edited by someone else\n")
+    outcome = sync.pull(home, agent="test-agent", hold=lambda path: path == "org-memory/recent.md")
+    assert outcome.status == "dirty" and not outcome.ok
+    assert "org-memory/recent.md" in outcome.lines[-1]
+    assert not (home / "org-memory/peer.md").exists()

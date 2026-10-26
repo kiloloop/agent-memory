@@ -14,6 +14,12 @@ files, both from the layout table; ``events/``, ``debriefs/`` and
 ``archive/`` are excluded), and the rendered text is cut at a character
 budget with a notice, so a hook can never flood a session.
 
+With ``--pull`` the session's runtime is the publishing identity, and a
+path another agent wrote is not its to publish: a debrief names its agent in
+its filename and an event in its frontmatter, so either one, when it names
+someone else, is held for that agent's own session. Files that carry no
+author (the curated org files, the project tier) publish as before.
+
 Output shapes: ``--json`` is the manifest itself, ``schema_version`` first;
 the default is what the runtime's hook expects on stdout: plain text for
 claude, whose session start takes stdout as context, and the hook JSON
@@ -28,8 +34,9 @@ import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import layout, sync
+from . import debrief, events, layout, sync
 from .git_runner import GitRunner, run_git
+from .publication import WriterError
 
 SCHEMA_VERSION = 1
 RUNTIME_CLAUDE = "claude"
@@ -46,6 +53,8 @@ RESULT_OK = "ok"
 RESULT_DEGRADED = "degraded"
 PULL_NOT_REQUESTED = "not_requested"
 PULL_ERROR = "error"
+#: The most of an event the author check reads; the frontmatter sits at its head.
+_EVENT_HEAD_BYTES = 64 * 1024
 
 
 def build_manifest(
@@ -161,7 +170,7 @@ def _sync(
     pull_info: Dict[str, Any] = {"requested": pull, "status": PULL_NOT_REQUESTED, "ok": True, "lines": []}
     if pull:
         try:
-            outcome = sync.pull(home, agent=runtime, runner=runner)
+            outcome = sync.pull(home, agent=runtime, runner=runner, hold=lambda path: _held(home, path, runtime))
             pull_info = {"requested": True, "status": outcome.status, "ok": outcome.ok, "lines": list(outcome.lines)}
         except (sync.SyncError, OSError) as exc:
             pull_info = {"requested": True, "status": PULL_ERROR, "ok": False, "lines": [f"memory pull: {exc}"]}
@@ -174,6 +183,40 @@ def _sync(
         if result.ok and stamp.isdigit():
             info["last_commit_at_utc"] = _iso(dt.datetime.fromtimestamp(int(stamp), dt.timezone.utc))
     return info, pull_info
+
+
+def _held(home: Path, relative: str, runtime: str) -> bool:
+    """Whether ``relative`` names an author other than ``runtime``; no author named means not held."""
+    author = author_of(home, relative)
+    return author is not None and author != runtime
+
+
+def author_of(home: Path, relative: str) -> Optional[str]:
+    """The agent a memory path names as its author, or ``None`` when it names none.
+
+    A debrief, ``org-memory/debriefs/<project>/<YYYY>/<MM>/<YYYYMMDD>-<agent>-<session>.md``,
+    names it in the filename: the session id has no dash, so the last dash
+    splits the agent from it whatever dashes the agent's own name carries. An
+    event, ``org-memory/events/<name>.md``, names it in the frontmatter
+    ``agent:`` field. Anything else, and anything that does not parse, names
+    no one.
+    """
+    parts = relative.split("/")
+    if parts[:2] == [layout.ORG.pattern, "debriefs"] and len(parts) == 6 and parts[5].endswith(".md"):
+        date, _, rest = parts[5][: -len(".md")].partition("-")
+        agent, _, session = rest.rpartition("-")
+        if len(date) == 8 and date.isdigit() and debrief.SESSION_RE.match(session) and debrief.AGENT_RE.match(agent):
+            return agent
+        return None
+    if parts[:2] == [layout.ORG.pattern, events.EVENTS_DIR] and len(parts) == 3 and parts[2].endswith(".md"):
+        try:
+            with open(home / relative, "rb") as handle:
+                frontmatter, _ = debrief.split_record(handle.read(_EVENT_HEAD_BYTES))
+        except (OSError, ValueError, WriterError):
+            return None
+        agent = frontmatter.get("agent", "")
+        return agent if debrief.AGENT_RE.match(agent) else None
+    return None
 
 
 # --- rendering --------------------------------------------------------------
