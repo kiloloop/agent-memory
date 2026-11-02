@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Memory"
+  short_description: "Recall, capture and sync cross-session project memory"
+  default_prompt: "Use $agent-memory to recall this project's memory before we start."

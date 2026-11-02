@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from .. import __version__, layout, workflow
+from .. import __version__, layout
 
 RECEIPT_SCHEMA_VERSION = 1
 SCRIPT_MODE = 0o755
@@ -68,18 +68,12 @@ KEEP_FLAG = "keep_flag"
 SETTINGS_CONFLICT = "settings_conflict"
 REMOVE_LEGACY_FILE = "remove_legacy_file"
 KEEP_LEGACY_FILE = "keep_legacy_file"
-WRITE_WORKFLOW = "write_workflow"
-REGENERATE_WORKFLOW = "regenerate_workflow"
-WORKFLOW_IN_PLACE = "workflow_in_place"
-WORKFLOW_CONFLICT = "workflow_conflict"
 
 CHANGING_ACTIONS = frozenset(
     {
         WRITE_SCRIPT,
         REGENERATE_SCRIPT,
         CHMOD_SCRIPT,
-        WRITE_WORKFLOW,
-        REGENERATE_WORKFLOW,
         CREATE_SETTINGS,
         REGISTER,
         RETIRE_REGISTRATION,
@@ -87,7 +81,7 @@ CHANGING_ACTIONS = frozenset(
         REMOVE_LEGACY_FILE,
     }
 )
-CONFLICT_ACTIONS = frozenset({SCRIPT_CONFLICT, SETTINGS_CONFLICT, WORKFLOW_CONFLICT})
+CONFLICT_ACTIONS = frozenset({SCRIPT_CONFLICT, SETTINGS_CONFLICT})
 
 #: How each action reads in the report: (marker, done, planned).
 VERBS: Dict[str, Tuple[str, str, str]] = {
@@ -106,10 +100,6 @@ VERBS: Dict[str, Tuple[str, str, str]] = {
     SETTINGS_CONFLICT: ("!", "conflict, not edited", "conflict, would not edit"),
     REMOVE_LEGACY_FILE: ("-", "removed", "would remove"),
     KEEP_LEGACY_FILE: ("!", "kept", "would keep"),
-    WRITE_WORKFLOW: ("+", "written", "would write"),
-    REGENERATE_WORKFLOW: ("~", "regenerated", "would regenerate"),
-    WORKFLOW_IN_PLACE: ("=", "in place", "in place"),
-    WORKFLOW_CONFLICT: ("!", "conflict, kept", "conflict, would keep"),
 }
 
 #: Tokens the shell reads as operators; a command carrying one is compound and is never edited.
@@ -164,10 +154,6 @@ class RuntimeSpec:
     legacy_flag: Optional[Tuple[Tuple[str, ...], str]] = None
     #: Digests of this runtime's script as earlier versions shipped it; those regenerate.
     previous_template_digests: Tuple[str, ...] = ()
-    #: The workflow file, repository-relative: this runtime's thin wrapper of the shipped workflow text.
-    workflow_file: str = ""
-    #: Digests of this runtime's workflow file as earlier versions shipped it; those regenerate.
-    previous_workflow_digests: Tuple[str, ...] = ()
 
     def hook(self) -> Dict[str, Any]:
         return {"type": "command", "command": self.script_file, "timeout": self.timeout, **dict(self.hook_fields)}
@@ -188,20 +174,6 @@ def template_digest(spec: RuntimeSpec) -> str:
 def known_template_digests(spec: RuntimeSpec) -> Tuple[str, ...]:
     """Every digest a file at the script path may carry and still count as this tool's."""
     return (template_digest(spec), *spec.previous_template_digests)
-
-
-def workflow_text(spec: RuntimeSpec) -> str:
-    """The workflow file for ``spec``, byte for byte what setup writes: the shipped text with the runtime's name."""
-    return workflow.workflow_text(spec.name)
-
-
-def workflow_digest(spec: RuntimeSpec) -> str:
-    return _digest_bytes(workflow_text(spec).encode("utf-8"))
-
-
-def known_workflow_digests(spec: RuntimeSpec) -> Tuple[str, ...]:
-    """Every digest a file at the workflow path may carry and still count as this tool's."""
-    return (workflow_digest(spec), *spec.previous_workflow_digests)
 
 
 @dataclass(frozen=True)
@@ -241,10 +213,6 @@ class Plan:
     receipt_path: Path
     receipt: Dict[str, Any]
     receipt_write: bool
-    #: Bytes to place at the workflow path; ``None`` when it is not written.
-    workflow_write: Optional[bytes] = None
-    #: Whether the workflow write replaces an earlier template (else it creates the file).
-    workflow_regenerate: bool = False
 
     @property
     def conflicts(self) -> List[Step]:
@@ -284,7 +252,6 @@ def plan_setup(
     script = _plan_script(spec, repo, steps)
     settings_write, data_after, settings_state = _plan_settings(spec, repo, steps, script_present=script.present)
     removals = _plan_legacy_files(spec, repo, data_after, settings_state, steps)
-    flow = _plan_workflow(spec, repo, steps)
 
     receipt_path = home / layout.SETUP_DIR / spec.name / f"{_repo_key(repo)}.json"
     previous = _load_json(receipt_path)
@@ -299,8 +266,6 @@ def plan_setup(
         script_mode=script.mode,
         settings_state=settings_state,
         settings_write=settings_write,
-        workflow_state=flow.state,
-        workflow_digest_value=flow.digest,
         previous=previous if isinstance(previous, dict) else None,
         now=now or dt.datetime.now(dt.timezone.utc),
     )
@@ -318,8 +283,6 @@ def plan_setup(
         receipt_path,
         receipt,
         receipt_write,
-        workflow_write=flow.write,
-        workflow_regenerate=flow.regenerate,
     )
 
 
@@ -393,60 +356,6 @@ def _plan_script(spec: RuntimeSpec, repo: Path, steps: List[Step]) -> _ScriptPla
         return _ScriptPlan(None, False, "conflict", content, _executable(mode), mode)
     steps.append(Step(WRITE_SCRIPT, rel, f"template digest {_short(current)}"))
     return _ScriptPlan(text, False, "written", current, True, SCRIPT_MODE)
-
-
-@dataclass(frozen=True)
-class _FilePlan:
-    #: Bytes to place at the path; ``None`` when nothing is written there.
-    write: Optional[bytes]
-    regenerate: bool
-    #: ``written``, ``regenerated``, ``in_place``, ``conflict``, or ``absent`` when the runtime has no such file.
-    state: str
-    digest: Optional[str]
-
-
-def _plan_workflow(spec: RuntimeSpec, repo: Path, steps: List[Step]) -> _FilePlan:
-    """The workflow file follows the script's rules without the execute bit: written once, regenerated only
-    while its digest is a shipped template, kept and named as a conflict when edited, never written through a link."""
-    if not spec.workflow_file:
-        return _FilePlan(None, False, "absent", None)
-    rel = spec.workflow_file
-    target = repo / rel
-    text = workflow_text(spec).encode("utf-8")
-    current = workflow_digest(spec)
-    known = known_workflow_digests(spec)
-
-    link = _linked_component(repo, target)
-    if link is not None:
-        content = _digest_file(target)
-        if content in known:
-            steps.append(
-                Step(WORKFLOW_IN_PLACE, rel, f"through the symlink {_rel(repo, link)} -> {_realpath(link)}; shared source left as it is")
-            )
-            return _FilePlan(None, False, "in_place", content)
-        what = "is missing or unreadable there" if content is None else "differs from every shipped template"
-        steps.append(
-            Step(WORKFLOW_CONFLICT, rel, f"{_rel(repo, link)} is a symlink to {_realpath(link)}; the shared source {what} and is not written through")
-        )
-        return _FilePlan(None, False, "conflict", content)
-    if os.path.lexists(target):
-        if not target.is_file():
-            steps.append(Step(WORKFLOW_CONFLICT, rel, "exists and is not a regular file"))
-            return _FilePlan(None, False, "conflict", None)
-        content = _digest_file(target)
-        if content is None:
-            steps.append(Step(WORKFLOW_CONFLICT, rel, "exists and cannot be read"))
-            return _FilePlan(None, False, "conflict", None)
-        if content == current:
-            steps.append(Step(WORKFLOW_IN_PLACE, rel, f"digest {_short(current)} is the shipped template"))
-            return _FilePlan(None, False, "in_place", content)
-        if content in known:
-            steps.append(Step(REGENERATE_WORKFLOW, rel, f"digest {_short(content)} is an earlier template; now {_short(current)}"))
-            return _FilePlan(text, True, "regenerated", current)
-        steps.append(Step(WORKFLOW_CONFLICT, rel, f"digest {_short(content)} matches no shipped template; edited, kept as it is"))
-        return _FilePlan(None, False, "conflict", content)
-    steps.append(Step(WRITE_WORKFLOW, rel, f"template digest {_short(current)}"))
-    return _FilePlan(text, False, "written", current)
 
 
 def _executable(mode: Optional[int]) -> bool:
@@ -604,8 +513,6 @@ def _receipt(
     script_mode: Optional[int],
     settings_state: str,
     settings_write: Optional[str],
-    workflow_state: str,
-    workflow_digest_value: Optional[str],
     previous: Optional[Dict[str, Any]],
     now: dt.datetime,
 ) -> Dict[str, Any]:
@@ -645,18 +552,6 @@ def _receipt(
             "registration": {"event": spec.event, "matcher": spec.matcher, "command": spec.script_file},
         },
     ]
-    if spec.workflow_file:
-        flow = repo / spec.workflow_file
-        managed.append(
-            {
-                "path": spec.workflow_file,
-                "resolved": _realpath(flow),
-                "symlink": _linked_component(repo, flow) is not None,
-                "state": "conflict" if workflow_state == "conflict" else "installed",
-                "digest": workflow_digest_value,
-                "template_digest": workflow_digest(spec),
-            }
-        )
     retired: List[Dict[str, Any]] = []
     if previous is not None and isinstance(previous.get("retired"), list):
         retired.extend(item for item in previous["retired"] if isinstance(item, dict))
@@ -707,13 +602,6 @@ def apply_plan(plan: Plan) -> None:
             _create_file(script, plan.script_write, SCRIPT_MODE)
     elif plan.script_chmod:
         _chmod_file(plan.repo / spec.script_file, SCRIPT_MODE)
-    if plan.workflow_write is not None:
-        flow = plan.repo / spec.workflow_file
-        flow.parent.mkdir(parents=True, exist_ok=True)
-        if plan.workflow_regenerate:
-            _replace_file(flow, plan.workflow_write, _mode_of(flow, 0o644))
-        else:
-            _create_file(flow, plan.workflow_write, 0o644)
     if plan.settings_write is not None:
         settings = plan.repo / spec.settings_file
         settings.parent.mkdir(parents=True, exist_ok=True)
@@ -763,7 +651,7 @@ def lines(result: Result) -> List[str]:
     if result.dry_run:
         out.append("dry run: nothing was written.")
     elif not plan.changed:
-        out.append("nothing to do: the hook and the workflow file are installed and in place.")
+        out.append("nothing to do: the hook is installed and in place.")
     return out
 
 

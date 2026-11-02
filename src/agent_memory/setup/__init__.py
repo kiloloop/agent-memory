@@ -16,15 +16,12 @@ from .common import (
     apply_plan,
     detect_repo,
     known_template_digests,
-    known_workflow_digests,
     lines,
     plan_setup,
     run_setup,
     script_text,
     template_digest,
     to_json,
-    workflow_digest,
-    workflow_text,
 )
 
 SPECS: Dict[str, RuntimeSpec] = {claude.SPEC.name: claude.SPEC, codex.SPEC.name: codex.SPEC}
@@ -41,13 +38,10 @@ __all__ = [
     "apply_plan",
     "detect_repo",
     "known_template_digests",
-    "known_workflow_digests",
     "lines",
     "plan_setup",
     "run_setup",
     "script_text",
     "template_digest",
     "to_json",
-    "workflow_digest",
-    "workflow_text",
 ]

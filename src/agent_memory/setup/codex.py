@@ -10,8 +10,7 @@ renders one for this runtime. The entry is the memory half only: it sits
 beside the kernel's ``session-init --hook`` entry, which keeps verifying
 protocol files and status, and only that entry's ``--pull-memory`` flag is
 retired, so memory is pulled once. Its ``additionalContextLimit`` belongs
-to it and is never touched. Beside the hook goes the workflow file, a
-repository skill under ``.agents/skills/``, where Codex discovers them.
+to it and is never touched.
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ SPEC = RuntimeSpec(
     event="SessionStart",
     matcher="^startup$",
     timeout=60,
-    workflow_file=".agents/skills/agent-memory/SKILL.md",
     report_body=REPORT_BODY,
     hook_fields={"statusMessage": "Pulling agent memory"},
     fresh_settings={"description": "agent-memory startup: pull the memory home and list the files to read."},

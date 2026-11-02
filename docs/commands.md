@@ -146,12 +146,11 @@ wrote, and no symlink lies between the repository and the file. Custom
 entries are untouched; the codex entry sits beside the kernel's
 session-init entry and retires only its pull flag, edited in place in one
 simple command (a compound command is left as written and named). No push
-hook is ever installed. Beside the hook, `setup` installs the runtime's memory
-workflow file, a repository skill (`.claude/skills/agent-memory/SKILL.md`,
-`.agents/skills/agent-memory/SKILL.md`) rendered from one shipped text with
-the runtime's name and managed by the hook's rules: written once, regenerated
-only while its digest is a shipped template, kept and named as a conflict when
-edited, never written through a symlink, and recorded in the receipt.
+hook is ever installed. `setup` installs no skill: the workflow is taught by
+the [`agent-memory` skill](../skills/agent-memory/README.md), installed
+separately. Release 0.1.4 and earlier also wrote a workflow file
+(`.claude/skills/agent-memory/SKILL.md`, `.agents/skills/agent-memory/SKILL.md`);
+`setup` now leaves an existing copy as it is and no longer records it.
 
 ## Startup
 
@@ -174,7 +173,7 @@ different home lends no project, and says so in the warnings.
 
 ## Capture and recall
 
-`capture` and `recall` are the workflow that file describes. `capture "<decision>"
+`capture` and `recall` are the workflow the skill describes. `capture "<decision>"
 [--why TEXT] [--source REF] [--agent NAME]` appends one decision to the
 project's `decision_log.md`, newest first under today's UTC date heading, with
 its provenance (the agent, the UTC time, the source); it touches no other
