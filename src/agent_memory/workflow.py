@@ -11,9 +11,8 @@ startup manifest lists, in the manifest's order, cut at a character budget
 with a notice: the bounded read the manifest describes but never performs.
 ``archive/``, ``events/`` and ``debriefs/`` are never loaded.
 
-The authored text is the workflow file ``setup <runtime>`` installs beside the
-hook, rendered from one shipped template with the runtime's name; every
-runtime's wrapper says the same thing.
+When to run them is taught by the ``agent-memory`` skill in the repository's
+``skills/`` directory; ``setup`` no longer writes a workflow file.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ import os
 import re
 import secrets
 import stat as stat_mod
-from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +30,6 @@ from . import layout, startup
 SCHEMA_VERSION = 1
 DECISION_FILE = "decision_log.md"
 DEFAULT_AGENT_ENV = "AGENT_MEMORY_AGENT"
-WORKFLOW_TEMPLATE = "templates/workflow/SKILL.md"
 
 _HEADING = re.compile(r"^## (\d{4}-\d{2}-\d{2})\s*$")
 _SPACE = re.compile(r"\s+")
@@ -40,15 +37,6 @@ _SPACE = re.compile(r"\s+")
 
 class WorkflowError(Exception):
     """A precondition failed; nothing was written."""
-
-
-# --- the authored text ---------------------------------------------------------
-
-
-def workflow_text(runtime: str) -> str:
-    """The workflow file for ``runtime``, byte for byte what setup writes."""
-    template = (resources.files(__package__) / WORKFLOW_TEMPLATE).read_text(encoding="utf-8")
-    return template.replace("{runtime}", runtime)
 
 
 # --- capture -------------------------------------------------------------------

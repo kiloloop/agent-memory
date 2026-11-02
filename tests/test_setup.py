@@ -18,7 +18,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import stat
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -36,8 +35,6 @@ from agent_memory.setup import (
     run_setup,
     script_text,
     template_digest,
-    workflow_digest,
-    workflow_text,
 )
 from agent_memory.setup.common import (
     CHMOD_SCRIPT,
@@ -54,11 +51,7 @@ from agent_memory.setup.common import (
     SCRIPT_IN_PLACE,
     SETTINGS_CONFLICT,
     STRIP_FLAG,
-    WORKFLOW_CONFLICT,
-    WORKFLOW_IN_PLACE,
-    REGENERATE_WORKFLOW,
     WRITE_SCRIPT,
-    WRITE_WORKFLOW,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "setup"
@@ -150,7 +143,7 @@ def _run_hook(spec: RuntimeSpec, repo: Path, env: Dict[str, str]) -> subprocess.
 def test_fresh_install(spec: RuntimeSpec, repo: Path, home: Path) -> None:
     result = run_setup(spec, repo, home)
     assert not result.plan.conflicts
-    assert _actions(result) == [WRITE_SCRIPT, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, CREATE_SETTINGS, REGISTER]
     script = repo / spec.script_file
     assert script.read_text(encoding="utf-8") == script_text(spec)
     assert script.stat().st_mode & 0o777 == 0o755
@@ -161,9 +154,7 @@ def test_fresh_install(spec: RuntimeSpec, repo: Path, home: Path) -> None:
     assert result.plan.receipt_path.parent == home / layout.SETUP_DIR / spec.name
     receipt = _load(result.plan.receipt_path)
     assert receipt["managed"][0]["digest"] == template_digest(spec) == _sha(script.read_bytes())
-    wrapper = repo / spec.workflow_file
-    assert wrapper.read_text(encoding="utf-8") == workflow_text(spec)
-    assert receipt["managed"][2]["digest"] == workflow_digest(spec) == _sha(wrapper.read_bytes())
+    assert [entry["path"] for entry in receipt["managed"]] == [spec.script_file, spec.settings_file]
 
 
 def test_no_push_hook_is_ever_installed(spec: RuntimeSpec, repo: Path, home: Path) -> None:
@@ -180,7 +171,7 @@ def test_rerun_changes_no_byte(spec: RuntimeSpec, repo: Path, home: Path) -> Non
     before = (_tree(repo), _tree(home))
     again = run_setup(spec, repo, home)
     assert not again.plan.changed
-    assert _actions(again) == [SCRIPT_IN_PLACE, REGISTERED, WORKFLOW_IN_PLACE]
+    assert _actions(again) == [SCRIPT_IN_PLACE, REGISTERED]
     assert (_tree(repo), _tree(home)) == before
 
 
@@ -200,7 +191,7 @@ def test_edited_script_is_a_named_conflict_and_kept(spec: RuntimeSpec, repo: Pat
     edited = script_text(spec) + "echo mine\n"
     script.write_text(edited, encoding="utf-8")
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_CONFLICT, REGISTERED, WORKFLOW_IN_PLACE]
+    assert _actions(result) == [SCRIPT_CONFLICT, REGISTERED]
     assert [step.path for step in result.plan.conflicts] == [spec.script_file]
     assert "edited" in result.plan.conflicts[0].detail
     assert script.read_text(encoding="utf-8") == edited
@@ -216,7 +207,7 @@ def test_an_earlier_template_is_regenerated(spec: RuntimeSpec, repo: Path, home:
     _place(repo, spec.script_file, old)
     older = dataclasses.replace(spec, previous_template_digests=(_sha(old.encode("utf-8")),))
     result = run_setup(older, repo, home)
-    assert _actions(result) == [REGENERATE_SCRIPT, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [REGENERATE_SCRIPT, CREATE_SETTINGS, REGISTER]
     script = repo / spec.script_file
     assert script.read_text(encoding="utf-8") == script_text(spec)
     assert script.stat().st_mode & 0o777 == 0o755
@@ -232,7 +223,7 @@ def test_symlinked_script_is_never_written_through(spec: RuntimeSpec, repo: Path
     script.symlink_to(shared)
 
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER]
     assert "symlink" in result.plan.steps[0].detail
     receipt = _load(result.plan.receipt_path)
     assert receipt["managed"][0]["symlink"] is True
@@ -240,7 +231,7 @@ def test_symlinked_script_is_never_written_through(spec: RuntimeSpec, repo: Path
 
     shared.write_text("# somebody else's hook\n", encoding="utf-8")
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_CONFLICT, REGISTERED, WORKFLOW_IN_PLACE]
+    assert _actions(result) == [SCRIPT_CONFLICT, REGISTERED]
     assert os.path.realpath(shared) in result.plan.conflicts[0].detail
     assert shared.read_text(encoding="utf-8") == "# somebody else's hook\n"
     assert script.is_symlink()
@@ -251,7 +242,7 @@ def test_dangling_script_symlink_holds_the_registration(spec: RuntimeSpec, repo:
     script.parent.mkdir(parents=True)
     script.symlink_to(tmp_path / "missing.sh")
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_CONFLICT, CREATE_SETTINGS, REGISTRATION_HELD, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_CONFLICT, CREATE_SETTINGS, REGISTRATION_HELD]
     assert not (tmp_path / "missing.sh").exists()
     assert _commands(_load(repo / spec.settings_file), spec.event) == []
     assert _load(result.plan.receipt_path)["managed"][1]["state"] == "held"
@@ -278,7 +269,7 @@ def test_symlinked_settings_file_is_not_edited(spec: RuntimeSpec, repo: Path, ho
     settings.parent.mkdir(parents=True)
     settings.symlink_to(shared)
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [WRITE_SCRIPT, SETTINGS_CONFLICT, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, SETTINGS_CONFLICT]
     assert os.path.realpath(shared) in result.plan.steps[1].detail
     assert shared.read_text(encoding="utf-8") == "{}\n"
     assert (repo / spec.script_file).is_file()
@@ -292,7 +283,7 @@ def test_symlinked_settings_file_is_not_edited(spec: RuntimeSpec, repo: Path, ho
 def test_unusable_settings_file_is_a_conflict_not_a_crash(spec: RuntimeSpec, repo: Path, home: Path, content: str) -> None:
     settings = _place(repo, spec.settings_file, content)
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [WRITE_SCRIPT, SETTINGS_CONFLICT, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, SETTINGS_CONFLICT]
     assert settings.read_text(encoding="utf-8") == content
 
 
@@ -315,19 +306,19 @@ def test_missing_repo_is_an_error(spec: RuntimeSpec, home: Path, tmp_path: Path)
 def test_resumes_after_an_interruption(spec: RuntimeSpec, repo: Path, home: Path) -> None:
     _place(repo, spec.script_file, script_text(spec))  # interrupted after the script was written
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER]
     result.plan.receipt_path.unlink()  # the receipt lost: rewritten, the repository untouched
     before = _tree(repo)
     again = run_setup(spec, repo, home)
     assert again.plan.receipt_write and again.plan.receipt_path.is_file()
-    assert _actions(again) == [SCRIPT_IN_PLACE, REGISTERED, WORKFLOW_IN_PLACE]
+    assert _actions(again) == [SCRIPT_IN_PLACE, REGISTERED]
     assert _tree(repo) == before
 
 
 def test_registration_without_a_script_gets_the_script(spec: RuntimeSpec, repo: Path, home: Path) -> None:
     settings = _place(repo, spec.settings_file, json.dumps({"hooks": {spec.event: [spec.entry()]}}))
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [WRITE_SCRIPT, REGISTERED, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, REGISTERED]
     assert _load(settings)["hooks"][spec.event] == [spec.entry()]
 
 
@@ -342,7 +333,7 @@ def test_registration_inside_a_custom_entry_is_not_duplicated_or_edited(spec: Ru
     original = json.dumps({"hooks": {spec.event: [custom]}}, indent=4)
     settings = _place(repo, spec.settings_file, original)
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [WRITE_SCRIPT, REGISTERED, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, REGISTERED]
     assert settings.read_text(encoding="utf-8") == original
 
 
@@ -378,7 +369,6 @@ def test_fleet_settings_retire_the_legacy_hooks_and_keep_custom_entries(repo: Pa
         REGISTER,
         REMOVE_LEGACY_FILE,
         REMOVE_LEGACY_FILE,
-        WRITE_WORKFLOW,
     ]
     after = _load(settings)
     assert "SessionEnd" not in after["hooks"]
@@ -503,7 +493,7 @@ def test_held_registration_leaves_the_legacy_hooks_in_place(repo: Path, home: Pa
     settings = repo / CLAUDE.settings_file
     before = settings.read_bytes()
     result = run_setup(CLAUDE, repo, home)
-    assert _actions(result) == [SCRIPT_CONFLICT, REGISTRATION_HELD, KEEP_LEGACY_FILE, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_CONFLICT, REGISTRATION_HELD, KEEP_LEGACY_FILE]
     assert "legacy hooks stay" in result.plan.steps[1].detail
     assert settings.read_bytes() == before
     assert _commands(_load(settings), "SessionStart") == [PULL]
@@ -532,7 +522,7 @@ def test_codex_entry_sits_beside_the_kernel_entry_and_retires_only_its_pull_flag
     fixture = _load(FIXTURES / "codex_hooks_kernel.json")
     result = run_setup(CODEX, repo, home)
     assert not result.plan.conflicts
-    assert _actions(result) == [WRITE_SCRIPT, STRIP_FLAG, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [WRITE_SCRIPT, STRIP_FLAG, REGISTER]
     after = _load(hooks_file)
     assert after["description"] == fixture["description"]
     kernel, custom, ours = after["hooks"]["SessionStart"]
@@ -546,7 +536,7 @@ def test_codex_entry_sits_beside_the_kernel_entry_and_retires_only_its_pull_flag
     assert ours["matcher"] == "^startup$" and ours["hooks"][0]["statusMessage"] == "Pulling agent memory"
     assert "additionalContextLimit" not in ours["hooks"][0]
     again = run_setup(CODEX, repo, home)
-    assert not again.plan.changed and _actions(again) == [SCRIPT_IN_PLACE, REGISTERED, WORKFLOW_IN_PLACE]
+    assert not again.plan.changed and _actions(again) == [SCRIPT_IN_PLACE, REGISTERED]
 
 
 def _codex_repo_with(repo: Path, command: str) -> Path:
@@ -587,11 +577,11 @@ def test_codex_pull_flag_is_retired_only_from_one_simple_command(repo: Path, hom
     assert not result.plan.conflicts
     kernel_after = _commands(_load(hooks_file), "SessionStart")[0]
     if expected is None:
-        assert _actions(result) == [WRITE_SCRIPT, KEEP_FLAG, REGISTER, WRITE_WORKFLOW]
+        assert _actions(result) == [WRITE_SCRIPT, KEEP_FLAG, REGISTER]
         assert kernel_after == before
         assert f"left in `{before}`" in result.plan.steps[1].detail
     else:
-        assert _actions(result) == [WRITE_SCRIPT, STRIP_FLAG, REGISTER, WRITE_WORKFLOW]
+        assert _actions(result) == [WRITE_SCRIPT, STRIP_FLAG, REGISTER]
         assert kernel_after == expected
     assert "--pull-memory" not in kernel_after or expected is None
     again = run_setup(CODEX, repo, home)
@@ -614,9 +604,9 @@ def test_template_without_its_execute_bit_is_repaired_and_runs(spec: RuntimeSpec
     script = _place(repo, spec.script_file, script_text(spec))
     script.chmod(0o644)
     dry = run_setup(spec, repo, home, dry_run=True)
-    assert _actions(dry) == [CHMOD_SCRIPT, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW] and script.stat().st_mode & 0o777 == 0o644
+    assert _actions(dry) == [CHMOD_SCRIPT, CREATE_SETTINGS, REGISTER] and script.stat().st_mode & 0o777 == 0o644
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [CHMOD_SCRIPT, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW] and not result.plan.conflicts
+    assert _actions(result) == [CHMOD_SCRIPT, CREATE_SETTINGS, REGISTER] and not result.plan.conflicts
     assert "0644" in result.plan.steps[0].detail
     assert script.stat().st_mode & 0o777 == 0o755
     assert script.read_text(encoding="utf-8") == script_text(spec)
@@ -625,7 +615,7 @@ def test_template_without_its_execute_bit_is_repaired_and_runs(spec: RuntimeSpec
     run = subprocess.run(["/bin/sh", "-c", spec.script_file], cwd=str(repo), capture_output=True, text=True, check=False)
     assert run.returncode == 0, run.stderr
     again = run_setup(spec, repo, home)
-    assert not again.plan.changed and _actions(again) == [SCRIPT_IN_PLACE, REGISTERED, WORKFLOW_IN_PLACE]
+    assert not again.plan.changed and _actions(again) == [SCRIPT_IN_PLACE, REGISTERED]
 
 
 def test_linked_template_without_its_execute_bit_is_held_not_chmodded(spec: RuntimeSpec, repo: Path, home: Path, tmp_path: Path) -> None:
@@ -636,7 +626,7 @@ def test_linked_template_without_its_execute_bit_is_held_not_chmodded(spec: Runt
     script.parent.mkdir(parents=True)
     script.symlink_to(shared)
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_CONFLICT, CREATE_SETTINGS, REGISTRATION_HELD, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_CONFLICT, CREATE_SETTINGS, REGISTRATION_HELD]
     assert "not executable (mode 0644)" in result.plan.steps[0].detail
     assert shared.stat().st_mode & 0o777 == 0o644 and script.is_symlink()
     assert _commands(_load(repo / spec.settings_file), spec.event) == []
@@ -656,7 +646,7 @@ def test_owner_executable_template_is_left_at_its_mode(spec: RuntimeSpec, repo: 
     script = _place(repo, spec.script_file, script_text(spec))
     script.chmod(0o700)
     result = run_setup(spec, repo, home)
-    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert _actions(result) == [SCRIPT_IN_PLACE, CREATE_SETTINGS, REGISTER]
     assert script.stat().st_mode & 0o777 == 0o700
     assert _load(result.plan.receipt_path)["managed"][0]["mode"] == "0700"
 
@@ -732,7 +722,7 @@ def test_cli_setup_reports_lines_json_and_dry_run(spec: RuntimeSpec, repo: Path,
     payload = json.loads(capsys.readouterr().out)
     assert payload["schema_version"] == 1 and payload["action"] == "setup" and payload["runtime"] == spec.name
     assert payload["changed"] is True and payload["conflicts"] == [] and payload["receipt"]["written"] is True
-    assert [step["action"] for step in payload["steps"]] == [WRITE_SCRIPT, CREATE_SETTINGS, REGISTER, WRITE_WORKFLOW]
+    assert [step["action"] for step in payload["steps"]] == [WRITE_SCRIPT, CREATE_SETTINGS, REGISTER]
     assert main(["setup", spec.name, "--repo", str(repo), "--home", str(home)]) == 0
     assert "nothing to do" in capsys.readouterr().out
     with pytest.raises(SystemExit) as exit_info:
@@ -755,7 +745,7 @@ def test_receipt_records_what_was_installed(spec: RuntimeSpec, repo: Path, home:
     assert receipt["schema_version"] == 1 and receipt["tool"] == "agent-memory" and receipt["version"] == __version__
     assert receipt["runtime"] == spec.name and receipt["repo"] == str(repo) and receipt["home"] == str(home)
     assert receipt["written_at_utc"].endswith("Z")
-    script, settings, flow = receipt["managed"]
+    script, settings = receipt["managed"]
     assert script == {
         "path": spec.script_file,
         "resolved": os.path.realpath(repo / spec.script_file),
@@ -768,14 +758,6 @@ def test_receipt_records_what_was_installed(spec: RuntimeSpec, repo: Path, home:
     assert settings["path"] == spec.settings_file and settings["state"] == "registered"
     assert settings["digest"] == _sha((repo / spec.settings_file).read_bytes())
     assert settings["registration"] == {"event": spec.event, "matcher": spec.matcher, "command": spec.script_file}
-    assert flow == {
-        "path": spec.workflow_file,
-        "resolved": os.path.realpath(repo / spec.workflow_file),
-        "symlink": False,
-        "state": "installed",
-        "digest": workflow_digest(spec),
-        "template_digest": workflow_digest(spec),
-    }
     assert receipt["retired"] == [] and receipt["conflicts"] == []
 
 
@@ -791,57 +773,34 @@ def test_setup_receipts_never_sync(tmp_path: Path, git_env: None) -> None:
     assert ignored.returncode == 0
 
 
-# --- the workflow file beside the hook -------------------------------------------
+# --- no workflow skill: the agent-memory skill in skills/ teaches the workflow -------
+
+#: Where release 0.1.4 and earlier wrote a generated workflow skill, per runtime.
+EARLIER_SKILL_FILES = {
+    "claude": ".claude/skills/agent-memory/SKILL.md",
+    "codex": ".agents/skills/agent-memory/SKILL.md",
+}
 
 
-def test_workflow_paths_are_the_runtimes_repository_skill_files() -> None:
-    assert CLAUDE.workflow_file == ".claude/skills/agent-memory/SKILL.md"
-    assert CODEX.workflow_file == ".agents/skills/agent-memory/SKILL.md"
-
-
-def test_workflow_file_is_the_shipped_text_with_the_runtime_name(spec: RuntimeSpec, repo: Path, home: Path) -> None:
-    run_setup(spec, repo, home)
-    wrapper = repo / spec.workflow_file
-    text = wrapper.read_text(encoding="utf-8")
-    assert text == workflow_text(spec) and f"workflow for {spec.name}" in text and f"--agent {spec.name}" in text
-    assert text.startswith("---\nname: agent-memory\n")
-    assert not wrapper.stat().st_mode & stat.S_IXUSR
-
-
-def test_edited_workflow_file_is_a_named_conflict_and_kept(spec: RuntimeSpec, repo: Path, home: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    run_setup(spec, repo, home)
-    wrapper = repo / spec.workflow_file
-    wrapper.write_text("# mine\n", encoding="utf-8")
-    again = run_setup(spec, repo, home)
-    assert [step.action for step in again.plan.conflicts] == [WORKFLOW_CONFLICT]
-    assert "edited, kept" in again.plan.conflicts[0].detail
-    assert wrapper.read_text(encoding="utf-8") == "# mine\n"
-    assert _load(again.plan.receipt_path)["managed"][2]["state"] == "conflict"
-    assert main(["setup", spec.name, "--home", str(home), "--repo", str(repo)]) == 3
-    assert f"! {spec.workflow_file}: conflict, kept" in capsys.readouterr().out
-
-
-def test_earlier_workflow_template_is_regenerated(spec: RuntimeSpec, repo: Path, home: Path) -> None:
-    run_setup(spec, repo, home)
-    wrapper = repo / spec.workflow_file
-    wrapper.write_text("# earlier\n", encoding="utf-8")
-    earlier = dataclasses.replace(spec, previous_workflow_digests=(_sha(b"# earlier\n"),))
-    again = run_setup(earlier, repo, home)
-    assert REGENERATE_WORKFLOW in _actions(again) and not again.plan.conflicts
-    assert wrapper.read_text(encoding="utf-8") == workflow_text(spec)
-
-
-def test_symlinked_workflow_file_is_never_written_through(spec: RuntimeSpec, repo: Path, home: Path, tmp_path: Path) -> None:
-    shared = tmp_path / "shared-skill.md"
-    shared.write_text("# shared\n", encoding="utf-8")
-    wrapper = repo / spec.workflow_file
-    wrapper.parent.mkdir(parents=True)
-    wrapper.symlink_to(shared)
+def test_setup_writes_no_skill_file(spec: RuntimeSpec, repo: Path, home: Path) -> None:
     result = run_setup(spec, repo, home)
-    assert [step.action for step in result.plan.conflicts] == [WORKFLOW_CONFLICT]
-    assert "is a symlink to" in result.plan.conflicts[0].detail
-    assert shared.read_text(encoding="utf-8") == "# shared\n" and wrapper.is_symlink()
-    assert _load(result.plan.receipt_path)["managed"][2]["symlink"] is True
+    assert not os.path.lexists(repo / EARLIER_SKILL_FILES[spec.name])
+    assert [path for path in _tree(repo) if "skills" in path] == []
+    assert all("skills" not in step.path for step in result.plan.steps)
+
+
+def test_an_earlier_generated_skill_is_left_as_it_is(spec: RuntimeSpec, repo: Path, home: Path) -> None:
+    earlier = repo / EARLIER_SKILL_FILES[spec.name]
+    earlier.parent.mkdir(parents=True)
+    earlier.write_text("---\nname: agent-memory\n---\n# earlier generated workflow\n", encoding="utf-8")
+    before = _tree(repo)[EARLIER_SKILL_FILES[spec.name]]
+    result = run_setup(spec, repo, home)
+    assert not result.plan.conflicts
+    assert all(step.path != EARLIER_SKILL_FILES[spec.name] for step in result.plan.steps)
+    assert _tree(repo)[EARLIER_SKILL_FILES[spec.name]] == before
+    receipt = _load(result.plan.receipt_path)
+    assert EARLIER_SKILL_FILES[spec.name] not in [entry["path"] for entry in receipt["managed"]]
+    assert not run_setup(spec, repo, home).plan.changed
 
 
 def test_setup_accepts_a_repository_without_git(spec: RuntimeSpec, home: Path, tmp_path: Path) -> None:
@@ -849,4 +808,4 @@ def test_setup_accepts_a_repository_without_git(spec: RuntimeSpec, home: Path, t
     scratch.mkdir()
     result = run_setup(spec, scratch, home)
     assert not result.plan.conflicts
-    assert (scratch / spec.script_file).is_file() and (scratch / spec.workflow_file).is_file()
+    assert (scratch / spec.script_file).is_file()

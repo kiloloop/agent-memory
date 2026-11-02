@@ -5,7 +5,9 @@
 
 Run ``make build`` first. Each step is fatal on failure:
 
-1. create a throwaway venv and install the newest ``dist/*.whl`` plus pytest, no extras;
+1. create a throwaway venv and install the newest ``dist/*.whl`` with no extras, then the
+   pytest requirement the wheel's own ``dev`` extra declares (pyproject.toml stays the one
+   declaration of that bound);
 2. assert the installed distribution declares no runtime dependencies and that the
    kernel package this tool is leaving is not importable in that venv;
 3. with AGENT_MEMORY_HOME and OACP_HOME stripped from the environment, scaffold a fresh
@@ -29,6 +31,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +50,17 @@ SCAFFOLD = (
 )
 ORG_FILES = ("recent.md", "decisions.md", "rules.md")
 PROJECT_FILES = ("project_facts.md", "decision_log.md", "open_threads.md", "known_debt.md")
+DEV_EXTRA = re.compile(r"""extra\s*==\s*["']dev["']""")
+
+
+def dev_requirement(declared: Sequence[str], name: str) -> str:
+    """Return the wheel's ``dev``-extra requirement for ``name``, marker stripped (``pytest<10,>=8``)."""
+    for entry in declared:
+        requirement, _, marker = entry.partition(";")
+        requirement = requirement.strip()
+        if DEV_EXTRA.search(marker) and re.match(rf"{re.escape(name)}(?![\w.-])", requirement, re.IGNORECASE):
+            return requirement
+    sys.exit(f"the wheel's dev extra declares no {name} requirement")
 
 
 def newest_wheel() -> Path:
@@ -102,15 +116,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env["PATH"] = os.pathsep.join([str(python.parent), env.get("PATH", "")])
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
 
-    run([python, "-m", "pip", "install", "--quiet", wheel, "pytest"], env)
+    run([python, "-m", "pip", "install", "--quiet", wheel], env)
 
     probe = run(
         [python, "-c", f"import importlib.metadata as m, json; print(json.dumps(m.requires({DISTRIBUTION!r}) or []))"],
         env,
     )
-    runtime = [entry for entry in json.loads(probe.stdout) if "extra ==" not in entry]
+    declared = json.loads(probe.stdout)
+    runtime = [entry for entry in declared if "extra ==" not in entry]
     if runtime:
         sys.exit(f"the wheel declares runtime dependencies: {runtime}")
+    run([python, "-m", "pip", "install", "--quiet", dev_requirement(declared, "pytest")], env)
     foreign = run(
         [python, "-c", "import importlib.util as u; raise SystemExit(0 if u.find_spec('oacp') is None else 1)"],
         env,

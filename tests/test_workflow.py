@@ -5,8 +5,8 @@
 The capture entry and its placement (newest first, one heading per UTC day),
 what capture refuses (a missing tier, a linked component below the home, an
 empty decision), the
-bounded read in manifest order with its budget and exclusions, the shipped
-workflow text, the CLI shapes, and the acceptance bar of the workflow issue:
+bounded read in manifest order with its budget and exclusions, the CLI
+shapes, and the acceptance bar of the workflow issue:
 two fresh sessions in a scratch repository with no git and no credentials,
 the first recording a seeded decision, the second receiving the bounded
 context through the installed hook and reading the decision back.
@@ -239,21 +239,6 @@ def test_recall_names_a_missing_file_and_reads_the_rest(home: Path) -> None:
     assert any("decision_log.md: missing" in warning for warning in result["warnings"])
 
 
-# --- the shipped text ----------------------------------------------------------
-
-
-@pytest.mark.parametrize("runtime", sorted(SPECS))
-def test_workflow_text_is_rendered_from_the_shipped_template(runtime: str) -> None:
-    text = workflow.workflow_text(runtime)
-    assert text.startswith("---\nname: agent-memory\ndescription: ")
-    assert f"# agent-memory workflow for {runtime}" in text
-    assert f"agent-memory setup {runtime}" in text and f"--agent {runtime}" in text
-    assert "{runtime}" not in text
-    assert "agent-memory recall" in text and "agent-memory capture" in text
-    for excluded in ("archive/", "events/", "debriefs/"):
-        assert excluded in text
-
-
 # --- the command line ----------------------------------------------------------
 
 
@@ -327,8 +312,7 @@ def test_two_fresh_sessions_recall_a_seeded_decision(tmp_path: Path, monkeypatch
     assert main(["setup", runtime, "--home", str(home), "--repo", str(scratch)]) == 0
     capsys.readouterr()
     spec = SPECS[runtime]
-    wrapper = scratch / spec.workflow_file
-    assert wrapper.read_text(encoding="utf-8") == workflow.workflow_text(runtime)
+    assert (scratch / spec.script_file).is_file()
     assert not (scratch / ".git").exists()
 
     # Session 1: records the seeded decision through the workflow, from the repository.

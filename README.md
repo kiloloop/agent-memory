@@ -26,7 +26,7 @@ https://github.com/kiloloop/agent-memory.
 
 Install with Python 3.10+. Ask for my home and project name, initialize and
 bind this repository, and git-ignore the binding. Set up my runtime's hook
-and workflow; report conflicts.
+and install the source's skills/agent-memory skill; report conflicts.
 
 Capture a decision I provide, with its reason and runtime. Show status and
 doctor. Next session here, recall context and report any truncation or sync
@@ -57,6 +57,9 @@ Python 3.10+ is required; sync needs git 2.25+, hooks use Bash, and
    # Or:
    agent-memory setup codex
    ```
+
+   Then copy the source's [`skills/agent-memory/`][skill] into your agent's
+   skills directory; it teaches the workflow below.
 
 4. **Record now; recall next session** in this repository:
 
@@ -116,10 +119,10 @@ and deliver. A plain `pull` updates a clean tree and reports unpushed commits.
 Conflicts abort the rebase and retain local commits. Keys and setup receipts
 stay local. Network and rebase operations time out after 30 seconds.
 
-`setup` installs a SessionStart hook and memory workflow. `startup` lists
+`setup` installs a SessionStart hook. `startup` lists
 metadata for the four project files, then the three curated org files; it
-injects no content. `--pull` commits and syncs first under the runtime identity, warning on failure. The workflow
-tells the agent to run `recall` for an 8,000-character bounded read. Raise
+injects no content. `--pull` commits and syncs first under the runtime identity, warning on failure. The
+[`agent-memory` skill][skill] tells the agent to run `recall` for an 8,000-character bounded read. Raise
 `--max-chars` or read remaining files directly when cut. `capture` records
 decisions during work. At the end, update threads and debt, optionally publish
 a summary with `debrief write`, and explicitly `push`; no push hook is installed.
@@ -150,6 +153,7 @@ similarity queries, synthesis, or indexing. Recall reads a fixed file set.
 | [`debrief write`][debrief-write] | Publish a session summary. |
 | [`event write`][event-write] | Publish an org-memory event. |
 
+[skill]: https://github.com/kiloloop/agent-memory/tree/main/skills/agent-memory
 [status]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#status
 [doctor]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#doctor
 [init]: https://github.com/kiloloop/agent-memory/blob/main/docs/commands.md#init
